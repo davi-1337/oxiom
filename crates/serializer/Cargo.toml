@@ -1,0 +1,11 @@
+[package]
+name = "oxiom-serializer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+oxiom-ir = { path = "../ir" }
+
+[dev-dependencies]
+oxiom-generator = { path = "../generator" }
+arbitrary = { version = "1", features = ["derive"] }
