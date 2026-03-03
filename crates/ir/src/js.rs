@@ -236,6 +236,103 @@ pub enum JsOperation {
     QueueMicrotask {
         operations: Vec<JsOperation>,
     },
+
+    // ========================================
+    // Extra high-value operations for crash finding
+    // ========================================
+
+    /// Scroll element into view (forces layout in scroll context).
+    ScrollIntoView {
+        target: NodeRef,
+    },
+
+    /// Focus an element (triggers focus-related layout).
+    FocusNode {
+        target: NodeRef,
+    },
+
+    /// Blur an element.
+    BlurNode {
+        target: NodeRef,
+    },
+
+    /// Create a new element and append to parent.
+    CreateElement {
+        parent: NodeRef,
+        tag: CreateElementTag,
+    },
+
+    /// document.write — destroys current document, extremely bug-prone.
+    DocumentWrite {
+        html: InnerHtmlContent,
+    },
+
+    /// Normalize text nodes (merges adjacent text nodes, can cause lifecycle bugs).
+    Normalize {
+        target: NodeRef,
+    },
+
+    /// Read scrollTop/scrollLeft to force scroll-related layout.
+    GetScrollMetrics {
+        target: NodeRef,
+    },
+
+    /// Set scrollTop to force scroll update.
+    SetScrollTop {
+        target: NodeRef,
+        value: u16,
+    },
+
+    /// Create a TreeWalker (holds references to nodes, can become stale).
+    TreeWalkerTraverse {
+        root: NodeRef,
+    },
+
+    /// element.replaceChildren() — removes all children and optionally adds new ones.
+    ReplaceChildren {
+        target: NodeRef,
+        html: InnerHtmlContent,
+    },
+}
+
+/// Tags for dynamically created elements.
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum CreateElementTag {
+    Div,
+    Span,
+    P,
+    Table,
+    Td,
+    Tr,
+    Details,
+    Summary,
+    Section,
+    Article,
+    Iframe,
+    Canvas,
+    Dialog,
+    Template,
+}
+
+impl CreateElementTag {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Div => "div",
+            Self::Span => "span",
+            Self::P => "p",
+            Self::Table => "table",
+            Self::Td => "td",
+            Self::Tr => "tr",
+            Self::Details => "details",
+            Self::Summary => "summary",
+            Self::Section => "section",
+            Self::Article => "article",
+            Self::Iframe => "iframe",
+            Self::Canvas => "canvas",
+            Self::Dialog => "dialog",
+            Self::Template => "template",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Arbitrary)]

@@ -497,6 +497,89 @@ fn serialize_operation(op: &JsOperation, out: &mut String, indent: usize) {
             }
             write!(out, "{pad}}});\n").unwrap();
         }
+
+        // Extra high-value operations
+        JsOperation::ScrollIntoView { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).scrollIntoView({{behavior:'instant',block:'nearest'}}); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::FocusNode { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).focus(); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::BlurNode { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).blur(); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::CreateElement { parent, tag } => {
+            write!(
+                out,
+                "{pad}try {{ var el = document.createElement('{}'); el.textContent = 'dyn'; getNode({}).appendChild(el); }} catch(e) {{}}\n",
+                tag.as_str(),
+                parent.0
+            ).unwrap();
+        }
+
+        JsOperation::DocumentWrite { html } => {
+            write!(
+                out,
+                "{pad}try {{ document.write('{}'); document.close(); }} catch(e) {{}}\n",
+                escape_js(&html.0)
+            ).unwrap();
+        }
+
+        JsOperation::Normalize { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).normalize(); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::GetScrollMetrics { target } => {
+            write!(
+                out,
+                "{pad}try {{ void getNode({}).scrollTop; void getNode({}).scrollLeft; void getNode({}).scrollHeight; }} catch(e) {{}}\n",
+                target.0, target.0, target.0
+            ).unwrap();
+        }
+
+        JsOperation::SetScrollTop { target, value } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).scrollTop = {}; }} catch(e) {{}}\n",
+                target.0, value
+            ).unwrap();
+        }
+
+        JsOperation::TreeWalkerTraverse { root } => {
+            write!(
+                out,
+                "{pad}try {{ var tw = document.createTreeWalker(getNode({}), NodeFilter.SHOW_ALL); while(tw.nextNode()) {{ void tw.currentNode.nodeName; }} }} catch(e) {{}}\n",
+                root.0
+            ).unwrap();
+        }
+
+        JsOperation::ReplaceChildren { target, html } => {
+            write!(
+                out,
+                "{pad}try {{ var tmpl = document.createElement('template'); tmpl.innerHTML = '{}'; getNode({}).replaceChildren(tmpl.content); }} catch(e) {{}}\n",
+                escape_js(&html.0),
+                target.0
+            ).unwrap();
+        }
     }
 }
 

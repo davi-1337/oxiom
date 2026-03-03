@@ -9,40 +9,127 @@ use tokio::process::Command;
 pub enum TestResult {
     /// Page loaded and exited cleanly.
     Ok,
-    /// Chrome crashed — contains ASAN/crash log.
-    Crash(String),
+    /// Chrome crashed — contains ASAN/crash log + crash type classification.
+    Crash {
+        log: String,
+        crash_type: CrashType,
+        signal: Option<i32>,
+        exit_code: Option<i32>,
+    },
     /// Timed out.
     Timeout,
 }
 
-/// ASAN signature patterns in stderr.
-const ASAN_SIGNATURES: &[&str] = &[
-    "AddressSanitizer",
-    "ERROR: AddressSanitizer",
-    "heap-use-after-free",
-    "heap-buffer-overflow",
-    "stack-buffer-overflow",
-    "global-buffer-overflow",
-    "use-after-poison",
-    "use-after-scope",
-    "stack-use-after-return",
-    "double-free",
-    "alloc-dealloc-mismatch",
-    "SEGV on unknown address",
-    "attempting free on address",
-    "READ of size",
-    "WRITE of size",
-    "LeakSanitizer",
-    "MemorySanitizer",
-    "UndefinedBehaviorSanitizer",
-    "ThreadSanitizer",
+/// Classification of the crash for deduplication and reporting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashType {
+    /// AddressSanitizer (UAF, buffer overflow, etc.)
+    Asan,
+    /// MemorySanitizer (uninitialized memory)
+    Msan,
+    /// UndefinedBehaviorSanitizer
+    Ubsan,
+    /// ThreadSanitizer (data race)
+    Tsan,
+    /// LeakSanitizer (memory leak)
+    Lsan,
+    /// Signal-based crash (SIGSEGV, SIGABRT, etc.) without sanitizer report
+    Signal,
+    /// Non-zero exit code crash
+    ExitCode,
+    /// Chrome process error
+    ProcessError,
+}
+
+impl CrashType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Asan => "ASAN",
+            Self::Msan => "MSAN",
+            Self::Ubsan => "UBSAN",
+            Self::Tsan => "TSAN",
+            Self::Lsan => "LSAN",
+            Self::Signal => "SIGNAL",
+            Self::ExitCode => "EXIT_CODE",
+            Self::ProcessError => "PROCESS_ERROR",
+        }
+    }
+
+    pub fn is_sanitizer(&self) -> bool {
+        matches!(self, Self::Asan | Self::Msan | Self::Ubsan | Self::Tsan | Self::Lsan)
+    }
+}
+
+/// ASAN/sanitizer signature patterns in stderr.
+const SANITIZER_PATTERNS: &[(&str, CrashType)] = &[
+    // AddressSanitizer patterns (most common)
+    ("ERROR: AddressSanitizer:", CrashType::Asan),
+    ("AddressSanitizer: heap-use-after-free", CrashType::Asan),
+    ("AddressSanitizer: heap-buffer-overflow", CrashType::Asan),
+    ("AddressSanitizer: stack-buffer-overflow", CrashType::Asan),
+    ("AddressSanitizer: global-buffer-overflow", CrashType::Asan),
+    ("AddressSanitizer: use-after-poison", CrashType::Asan),
+    ("AddressSanitizer: use-after-scope", CrashType::Asan),
+    ("AddressSanitizer: stack-use-after-return", CrashType::Asan),
+    ("AddressSanitizer: double-free", CrashType::Asan),
+    ("AddressSanitizer: alloc-dealloc-mismatch", CrashType::Asan),
+    ("AddressSanitizer: attempting free on address", CrashType::Asan),
+    ("AddressSanitizer: SEGV on unknown address", CrashType::Asan),
+    ("AddressSanitizer: stack-overflow", CrashType::Asan),
+    ("AddressSanitizer: container-overflow", CrashType::Asan),
+    ("AddressSanitizer: negative-size-param", CrashType::Asan),
+    ("AddressSanitizer: calloc-overflow", CrashType::Asan),
+    ("AddressSanitizer: allocator is out of memory", CrashType::Asan),
+    ("AddressSanitizer: odr-violation", CrashType::Asan),
+    // Bare patterns (ASAN output without prefix)
+    ("READ of size", CrashType::Asan),
+    ("WRITE of size", CrashType::Asan),
+    ("heap-use-after-free on address", CrashType::Asan),
+    ("heap-buffer-overflow on address", CrashType::Asan),
+    ("SUMMARY: AddressSanitizer:", CrashType::Asan),
+    // MemorySanitizer
+    ("MemorySanitizer", CrashType::Msan),
+    ("WARNING: MemorySanitizer:", CrashType::Msan),
+    // UndefinedBehaviorSanitizer
+    ("UndefinedBehaviorSanitizer", CrashType::Ubsan),
+    ("runtime error:", CrashType::Ubsan),
+    // ThreadSanitizer
+    ("ThreadSanitizer", CrashType::Tsan),
+    ("WARNING: ThreadSanitizer:", CrashType::Tsan),
+    // LeakSanitizer
+    ("LeakSanitizer", CrashType::Lsan),
+    ("ERROR: LeakSanitizer:", CrashType::Lsan),
+    ("detected memory leaks", CrashType::Lsan),
 ];
 
-/// Check if stderr output contains ASAN crash indicators.
-fn find_asan_crash(stderr: &str) -> Option<String> {
-    for sig in ASAN_SIGNATURES {
-        if stderr.contains(sig) {
-            return Some(stderr.to_string());
+/// Check if stderr output contains sanitizer crash indicators.
+/// Returns the crash type if found.
+fn classify_crash(stderr: &str) -> Option<CrashType> {
+    // Check patterns in order (most specific first)
+    for (pattern, crash_type) in SANITIZER_PATTERNS {
+        if stderr.contains(pattern) {
+            return Some(*crash_type);
+        }
+    }
+    None
+}
+
+/// Extract the ASAN error type from the log (e.g., "heap-use-after-free").
+pub fn extract_asan_error_type(log: &str) -> Option<&str> {
+    for line in log.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("ERROR: AddressSanitizer:") {
+            // "ERROR: AddressSanitizer: heap-use-after-free on address..."
+            if let Some(after) = trimmed.strip_prefix("==").and_then(|s| s.find("ERROR: AddressSanitizer: ").map(|p| &s[p + 24..])) {
+                let error_type = after.split_whitespace().next().unwrap_or("unknown");
+                return Some(error_type);
+            }
+            // Fallback: just find after "AddressSanitizer: "
+            if let Some(pos) = trimmed.find("AddressSanitizer: ") {
+                let after = &trimmed[pos + 18..];
+                let error_type = after.split([' ', '\n'].as_ref()).next().unwrap_or("unknown");
+                return Some(error_type);
+            }
         }
     }
     None
@@ -101,7 +188,11 @@ fn build_chrome_command(
     cmd
 }
 
-/// Run a single test case: spawn Chrome headless, wait, parse stderr for ASAN.
+/// Run a single test case: spawn Chrome headless, read stderr concurrently, check for crashes.
+///
+/// Key design: stderr is read concurrently with process execution to avoid
+/// pipe buffer deadlocks. ASAN output can be very large (100KB+), and if the
+/// pipe buffer fills up, Chrome will block on write and never exit.
 pub async fn run_testcase(
     chrome_path: &Path,
     html_path: &Path,
@@ -113,21 +204,59 @@ pub async fn run_testcase(
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return TestResult::Crash(format!("Failed to spawn Chrome: {}", e));
+            return TestResult::Crash {
+                log: format!("Failed to spawn Chrome: {}", e),
+                crash_type: CrashType::ProcessError,
+                signal: None,
+                exit_code: None,
+            };
         }
     };
 
-    // Wait with timeout
+    // Take stderr handle immediately and read concurrently with process execution.
+    // This prevents pipe buffer deadlock when ASAN produces large output.
+    let stderr_handle = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        if let Some(mut stderr) = stderr_handle {
+            let mut buf = Vec::with_capacity(256 * 1024); // 256KB initial capacity
+            match tokio::time::timeout(
+                Duration::from_secs(30), // generous timeout for stderr reading
+                stderr.read_to_end(&mut buf),
+            )
+            .await
+            {
+                Ok(Ok(_)) => String::from_utf8_lossy(&buf).to_string(),
+                Ok(Err(_)) => String::from_utf8_lossy(&buf).to_string(),
+                Err(_) => {
+                    // Timeout reading stderr — return what we have
+                    String::from_utf8_lossy(&buf).to_string()
+                }
+            }
+        } else {
+            String::new()
+        }
+    });
+
+    // Wait for process with timeout
     let wait_result = tokio::time::timeout(timeout, child.wait()).await;
+
+    // Get stderr output (wait for the concurrent reader to finish)
+    let stderr = match tokio::time::timeout(Duration::from_secs(5), stderr_task).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(_)) => String::new(),
+        Err(_) => String::new(),
+    };
 
     match wait_result {
         Ok(Ok(status)) => {
-            // Read stderr
-            let stderr = read_stderr(&mut child).await;
-
-            // Check for ASAN in stderr
-            if let Some(asan_log) = find_asan_crash(&stderr) {
-                return TestResult::Crash(asan_log);
+            // Check for sanitizer crash in stderr (highest priority)
+            if let Some(crash_type) = classify_crash(&stderr) {
+                return TestResult::Crash {
+                    log: stderr,
+                    crash_type,
+                    signal: None,
+                    exit_code: status.code(),
+                };
             }
 
             // Check exit code — signals indicate crashes
@@ -142,49 +271,44 @@ pub async fn run_testcase(
                         signal_name(signal),
                         stderr,
                     );
-                    return TestResult::Crash(crash_log);
+                    return TestResult::Crash {
+                        log: crash_log,
+                        crash_type: CrashType::Signal,
+                        signal: Some(signal),
+                        exit_code: None,
+                    };
                 }
             }
 
             if !status.success() {
-                // Non-zero exit but no signal — could be renderer crash
                 let code = status.code().unwrap_or(-1);
-                if code != 0 {
-                    if !stderr.is_empty() && stderr.len() > 50 {
-                        return TestResult::Crash(format!(
+                // Non-zero exit with substantial stderr indicates renderer crash
+                if code != 0 && !stderr.is_empty() && stderr.len() > 50 {
+                    return TestResult::Crash {
+                        log: format!(
                             "Chrome exited with code {}\n\nSTDERR:\n{}",
                             code, stderr
-                        ));
-                    }
+                        ),
+                        crash_type: CrashType::ExitCode,
+                        signal: None,
+                        exit_code: Some(code),
+                    };
                 }
             }
 
             TestResult::Ok
         }
-        Ok(Err(e)) => {
-            let stderr = read_stderr(&mut child).await;
-            TestResult::Crash(format!("Chrome wait error: {}\n\nSTDERR:\n{}", e, stderr))
-        }
+        Ok(Err(e)) => TestResult::Crash {
+            log: format!("Chrome wait error: {}\n\nSTDERR:\n{}", e, stderr),
+            crash_type: CrashType::ProcessError,
+            signal: None,
+            exit_code: None,
+        },
         Err(_) => {
             // Timeout — kill the process
             let _ = child.kill().await;
             TestResult::Timeout
         }
-    }
-}
-
-async fn read_stderr(child: &mut tokio::process::Child) -> String {
-    if let Some(mut stderr) = child.stderr.take() {
-        let mut buf = Vec::with_capacity(8192);
-        // Read up to 64KB of stderr
-        let _ = tokio::time::timeout(
-            Duration::from_millis(500),
-            stderr.read_to_end(&mut buf),
-        )
-        .await;
-        String::from_utf8_lossy(&buf).to_string()
-    } else {
-        String::new()
     }
 }
 
@@ -196,6 +320,7 @@ fn signal_name(sig: i32) -> &'static str {
         7 => "SIGBUS",
         8 => "SIGFPE",
         11 => "SIGSEGV",
+        15 => "SIGTERM",
         _ => "UNKNOWN",
     }
 }

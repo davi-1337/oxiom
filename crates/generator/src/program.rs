@@ -19,41 +19,14 @@ pub struct FuzzProgram {
 
 impl<'a> Arbitrary<'a> for FuzzProgram {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
-        // Phase 5: multi-pattern — combine 2-3 templates per program
-        let pattern_count = u.int_in_range(1..=3)?;
-        let mut patterns = Vec::with_capacity(pattern_count);
-        for _ in 0..pattern_count {
-            patterns.push(u.arbitrary::<TemplatePattern>()?);
-        }
-
         let font_faces = generate_font_faces(u)?;
         let dom = generate_dom(u)?;
         let css_rules = generate_css_rules(u, &font_faces)?;
-
-        // Phase 1: generate keyframes for every animation in css_rules
         let keyframes = generate_keyframes(u, &css_rules)?;
-
-        // Phase 8: generate some at-rules
         let at_rules = generate_at_rules(u)?;
 
-        // Combine scripts from multiple patterns
-        let mut script = Vec::new();
-        for pattern in &patterns {
-            let mut ops = generate_script(u, pattern, &font_faces)?;
-            script.append(&mut ops);
-        }
-
-        // Optionally interleave operations
-        if pattern_count > 1 && u.ratio(1, 3)? {
-            // Shuffle operations for interleaving
-            let len = script.len();
-            if len > 1 {
-                for i in (1..len).rev() {
-                    let j = u.int_in_range(0..=i)?;
-                    script.swap(i, j);
-                }
-            }
-        }
+        // Generate mega-script: multi-phase state accumulation + timing chains
+        let script = generate_mega_script(u, &font_faces)?;
 
         Ok(FuzzProgram {
             font_faces,
@@ -66,46 +39,757 @@ impl<'a> Arbitrary<'a> for FuzzProgram {
     }
 }
 
-/// Template patterns that focus on specific UAF trigger scenarios.
-#[derive(Debug, Clone, Copy, Arbitrary)]
-enum TemplatePattern {
-    /// Font load + DOM removal during callback.
-    FontLoadRemove,
-    /// Style recalc during animation frame.
-    StyleRecalcAnimation,
-    /// ContentVisibility toggle + forced layout.
-    ContentVisibilityToggle,
-    /// Grid/flex relayout during font swap.
-    GridRelayoutFontSwap,
-    /// Random mix of operations.
-    RandomMix,
-    /// DOM tree manipulation stress.
-    DomTreeStress,
-    /// Font face API churn.
-    FontFaceChurn,
-    /// Rapid display toggling.
-    DisplayToggle,
-    // Phase 5: new templates
-    /// 30-80 rapid-fire random ops + forced layout + GC.
-    OperationStorm,
-    /// Create complex state -> mutate -> layout -> destroy -> layout stale ref -> re-create.
-    StateMachine,
-    /// 3-6 nested rAF with different ops each frame.
-    MultiFrameChain,
-    /// attachShadow + innerHTML + remove host + layout.
-    ShadowDomStress,
-    /// MutationObserver observe, then mutate observed tree in callback.
-    ObserverTrigger,
-    /// Create iframe -> mutate content -> remove iframe -> layout -> GC.
-    IframeCycle,
-    /// contentEditable + execCommand + forced layout.
-    EditingStress,
-    /// Element A style change invalidates element B layout.
-    CrossElementInteraction,
+// ============================
+// MEGA SCRIPT GENERATION
+// ============================
+
+/// Generate an extremely aggressive, state-accumulating script.
+/// This is the core of crash-finding: create complex state, force layout,
+/// mutate, force layout on stale refs, GC, access freed memory.
+fn generate_mega_script(
+    u: &mut Unstructured,
+    font_faces: &[FontFaceDecl],
+) -> arbitrary::Result<Vec<JsOperation>> {
+    // Choose between different mega-strategies
+    let strategy: u8 = u.int_in_range(0..=4)?;
+
+    let mut all_ops = match strategy {
+        0 => generate_phased_attack(u, font_faces)?,
+        1 => generate_timing_maze(u)?,
+        2 => generate_chaos_storm(u)?,
+        3 => generate_lifecycle_abuse(u, font_faces)?,
+        _ => generate_observer_cascade(u)?,
+    };
+
+    // Always append a final GC + stale ref access burst
+    append_stale_ref_burst(u, &mut all_ops)?;
+
+    Ok(all_ops)
 }
 
+/// Phased attack: setup → layout → mutate → destroy → GC → stale access → rebuild.
+/// This is the classic UAF-finding pattern with maximum state accumulation.
+fn generate_phased_attack(
+    u: &mut Unstructured,
+    font_faces: &[FontFaceDecl],
+) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::with_capacity(300);
+
+    // ---- PHASE 1: Build complex state (15-30 ops) ----
+    let setup_count = u.int_in_range(15..=30)?;
+    for _ in 0..setup_count {
+        match try_gen(u) {
+            Some(op) => ops.push(op),
+            None => break,
+        }
+    }
+
+    // Attach shadow roots to several nodes
+    for i in 0..u.int_in_range(2..=5)? {
+        let target = NodeRef(i * 3);
+        ops.push(JsOperation::AttachShadowRoot {
+            target,
+            mode: ShadowRootMode::Open,
+        });
+        ops.push(JsOperation::ShadowRootSetInnerHTML {
+            host: target,
+            html: InnerHtmlContent("<div><slot></slot><span style='display:grid'>shadow</span></div>".to_string()),
+        });
+    }
+
+    // Set up containment and complex layout on nodes
+    for i in 0..u.int_in_range(3..=8)? {
+        let target = NodeRef(i * 2);
+        let prop = pick_dangerous_css(u)?;
+        ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: prop,
+        });
+    }
+
+    // Load fonts (triggers font swap → layout invalidation)
+    for face in font_faces.iter().take(3) {
+        ops.push(JsOperation::FontFaceLoad {
+            family: String8(face.family.0.clone()),
+        });
+    }
+
+    // ---- PHASE 2: Force initial layout everywhere (5-10 ops) ----
+    for i in 0..u.int_in_range(5..=10)? {
+        let target = NodeRef(i);
+        match i % 4 {
+            0 => ops.push(JsOperation::GetOffsetWidth { target }),
+            1 => ops.push(JsOperation::GetOffsetHeight { target }),
+            2 => ops.push(JsOperation::GetBoundingClientRect { target }),
+            _ => ops.push(JsOperation::GetComputedStyle {
+                target,
+                property_name: StylePropertyName::Display,
+            }),
+        }
+    }
+
+    // ---- PHASE 3: Mutation storm (30-100 ops) ----
+    // Generate as many mutations as bytes allow, interleaved with layout forcing
+    let storm_count = u.int_in_range(30..=100)?;
+    for j in 0..storm_count {
+        match try_gen_mutation(u) {
+            Some(op) => ops.push(op),
+            None => break,
+        }
+
+        // Force layout every 3-5 operations (creates dangling pointer opportunities)
+        if j % 4 == 0 {
+            if let Some(target) = try_node(u) {
+                ops.push(JsOperation::GetOffsetWidth { target });
+            }
+        }
+
+        // GC every 15-20 ops
+        if j % 17 == 0 {
+            ops.push(JsOperation::ForceGC);
+        }
+    }
+
+    // ---- PHASE 4: Teardown — remove nodes, destroy state ----
+    let teardown_count = u.int_in_range(8..=15)?;
+    for _ in 0..teardown_count {
+        if let Some(target) = try_node(u) {
+            let choice: u8 = u.int_in_range(0..=5).unwrap_or(0);
+            match choice {
+                0 => ops.push(JsOperation::RemoveChild { target }),
+                1 => ops.push(JsOperation::SetInnerHTML {
+                    target,
+                    html: InnerHtmlContent("".to_string()),
+                }),
+                2 => ops.push(JsOperation::ReplaceChildren {
+                    target,
+                    html: InnerHtmlContent("".to_string()),
+                }),
+                3 => ops.push(JsOperation::AdoptNode { target }),
+                4 => {
+                    if let Some(start) = try_node(u) {
+                        ops.push(JsOperation::RangeDeleteContents {
+                            start_node: start,
+                            end_node: target,
+                        });
+                    }
+                }
+                _ => ops.push(JsOperation::RemoveChild { target }),
+            }
+        }
+    }
+
+    // ---- PHASE 5: GC + stale reference access (the UAF trigger) ----
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::ForceGC);
+
+    for i in 0..u.int_in_range(5..=12)? {
+        let target = NodeRef(i);
+        ops.push(JsOperation::GetOffsetWidth { target });
+        ops.push(JsOperation::GetBoundingClientRect { target });
+    }
+
+    // ---- PHASE 6: Rebuild via innerHTML + layout (double-free territory) ----
+    for i in 0..u.int_in_range(3..=6)? {
+        let target = NodeRef(i * 4);
+        ops.push(JsOperation::SetInnerHTML {
+            target,
+            html: InnerHtmlContent(
+                "<div style='display:grid;contain:strict'><span>rebuilt</span></div>".to_string(),
+            ),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target });
+    }
+    ops.push(JsOperation::ForceGC);
+
+    // Wrap phases 3-5 in timing chain for temporal sensitivity
+    ops = wrap_in_timing_chain(u, ops)?;
+
+    Ok(ops)
+}
+
+/// Timing maze: 5-8 levels of nested timing (rAF → microtask → rAF → setTimeout → rAF).
+/// Each level mutates different nodes and forces layout. The timing interleaving
+/// creates windows where freed memory can be reused.
+fn generate_timing_maze(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let depth = u.int_in_range(5..=8)?;
+    let mut ops = Vec::with_capacity(100);
+
+    // Initial setup
+    for _ in 0..u.int_in_range(5..=10)? {
+        match try_gen(u) {
+            Some(op) => ops.push(op),
+            None => break,
+        }
+    }
+
+    // Force initial layout
+    for i in 0..5u16 {
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+    }
+
+    // Build timing chain from inside out
+    let mut inner: Vec<JsOperation> = vec![
+        JsOperation::ForceGC,
+        JsOperation::ForceGC,
+    ];
+    // Innermost: access stale refs
+    for i in 0..8u16 {
+        inner.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+        inner.push(JsOperation::GetBoundingClientRect { target: NodeRef(i) });
+    }
+
+    for level in 0..depth {
+        let mut frame_ops: Vec<JsOperation> = Vec::new();
+
+        // Each level: mutate → layout → GC → stale access
+        let target = NodeRef((level * 3) as u16);
+        let prop = pick_dangerous_css(u)?;
+        frame_ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: prop,
+        });
+        frame_ops.push(JsOperation::GetOffsetWidth { target });
+
+        // Destroy something at this level
+        let destroy_target = NodeRef((level * 3 + 1) as u16);
+        frame_ops.push(JsOperation::RemoveChild { target: destroy_target });
+        frame_ops.push(JsOperation::ForceGC);
+        frame_ops.push(JsOperation::GetOffsetWidth { target: destroy_target }); // stale!
+
+        // Add some random mutations
+        for _ in 0..u.int_in_range(2..=6)? {
+            match try_gen_mutation(u) {
+                Some(op) => frame_ops.push(op),
+                None => break,
+            }
+        }
+
+        // Nest the inner chain using alternating timing APIs
+        let wrapped_inner = match level % 3 {
+            0 => JsOperation::RequestAnimationFrame { operations: inner },
+            1 => JsOperation::QueueMicrotask { operations: inner },
+            _ => JsOperation::SetTimeout { delay_ms: 0, operations: inner },
+        };
+        frame_ops.push(wrapped_inner);
+
+        inner = frame_ops;
+    }
+
+    // Outermost wrapper
+    ops.push(JsOperation::RequestAnimationFrame { operations: inner });
+
+    // Also run parallel timing chains (concurrent stale access)
+    let mut parallel_chain: Vec<JsOperation> = Vec::new();
+    for _ in 0..u.int_in_range(5..=12)? {
+        match try_gen_mutation(u) {
+            Some(op) => parallel_chain.push(op),
+            None => break,
+        }
+    }
+    parallel_chain.push(JsOperation::ForceGC);
+    for i in 0..6u16 {
+        parallel_chain.push(JsOperation::GetOffsetWidth { target: NodeRef(i * 5) });
+    }
+    ops.push(JsOperation::SetTimeout {
+        delay_ms: 0,
+        operations: parallel_chain,
+    });
+
+    Ok(ops)
+}
+
+/// Chaos storm: 80-300 rapid-fire random ops with interleaved GC + layout forcing.
+/// Pure volume — overwhelm Chrome's lifecycle management.
+fn generate_chaos_storm(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::with_capacity(400);
+
+    // Generate as many ops as the byte buffer allows
+    let max_ops = u.int_in_range(80..=300)?;
+    for j in 0..max_ops {
+        match try_gen(u) {
+            Some(op) => ops.push(op),
+            None => break,
+        }
+
+        // Aggressive layout forcing every 3 ops
+        if j % 3 == 0 {
+            if let Some(target) = try_node(u) {
+                ops.push(JsOperation::GetOffsetWidth { target });
+            }
+        }
+
+        // GC every 10 ops
+        if j % 10 == 0 {
+            ops.push(JsOperation::ForceGC);
+        }
+
+        // Scroll into view every 15 ops (different layout path)
+        if j % 15 == 0 {
+            if let Some(target) = try_node(u) {
+                ops.push(JsOperation::ScrollIntoView { target });
+            }
+        }
+    }
+
+    // Final GC + massive stale ref scan
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::ForceGC);
+    for i in 0..20u16 {
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+        ops.push(JsOperation::GetBoundingClientRect { target: NodeRef(i) });
+    }
+
+    // Wrap half the ops in a timing chain
+    ops = wrap_in_timing_chain(u, ops)?;
+
+    Ok(ops)
+}
+
+/// Lifecycle abuse: create → layout → adoptNode → layout stale → re-insert → iframe cycle.
+/// Targets document lifecycle and node adoption edge cases.
+fn generate_lifecycle_abuse(
+    u: &mut Unstructured,
+    font_faces: &[FontFaceDecl],
+) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::with_capacity(200);
+
+    let cycles = u.int_in_range(3..=6)?;
+    for cycle in 0..cycles {
+        let base = (cycle * 8) as u16;
+
+        // Create complex subtree
+        let parent = NodeRef(base);
+        for j in 0..u.int_in_range(2..=4)? {
+            ops.push(JsOperation::CreateElement {
+                parent,
+                tag: u.arbitrary().unwrap_or(CreateElementTag::Div),
+            });
+            let child = NodeRef(base + j as u16 + 1);
+            ops.push(JsOperation::SetInlineStyle {
+                target: child,
+                property: pick_dangerous_css(u)?,
+            });
+        }
+
+        // Shadow DOM on parent
+        ops.push(JsOperation::AttachShadowRoot {
+            target: parent,
+            mode: ShadowRootMode::Open,
+        });
+        ops.push(JsOperation::ShadowRootSetInnerHTML {
+            host: parent,
+            html: InnerHtmlContent(
+                "<slot></slot><div style='display:contents'>shadow</div>".to_string(),
+            ),
+        });
+
+        // Force layout
+        ops.push(JsOperation::GetOffsetWidth { target: parent });
+        ops.push(JsOperation::GetBoundingClientRect { target: parent });
+
+        // adoptNode — removes from document, layout objects become stale
+        ops.push(JsOperation::AdoptNode { target: parent });
+        ops.push(JsOperation::ForceGC);
+
+        // Access stale layout (UAF territory)
+        ops.push(JsOperation::GetOffsetWidth { target: parent });
+        ops.push(JsOperation::GetOffsetHeight { target: parent });
+
+        // Re-insert into document
+        let new_parent = NodeRef(base.wrapping_add(10));
+        ops.push(JsOperation::AppendChild {
+            parent: new_parent,
+            child: parent,
+        });
+        ops.push(JsOperation::GetOffsetWidth { target: parent });
+
+        // Iframe cycle
+        ops.push(JsOperation::CreateIframe {
+            target: parent,
+            src_html: InnerHtmlContent(
+                "<html><body style='display:grid'><div>iframe content</div></body></html>"
+                    .to_string(),
+            ),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target: parent });
+        ops.push(JsOperation::RemoveIframe { target: parent });
+        ops.push(JsOperation::ForceGC);
+        ops.push(JsOperation::GetOffsetWidth { target: parent });
+    }
+
+    // Font swap stress (font load → layout invalidation → stale sizing)
+    for face in font_faces.iter().take(3) {
+        ops.push(JsOperation::FontFaceAdd {
+            family: String8(face.family.0.clone()),
+            source: FontFaceSource::DataUrl,
+        });
+        ops.push(JsOperation::FontFaceLoad {
+            family: String8(face.family.0.clone()),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(0) });
+        ops.push(JsOperation::FontFaceRemove {
+            family: String8(face.family.0.clone()),
+        });
+        ops.push(JsOperation::ForceGC);
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(0) });
+    }
+
+    // Editing stress at the end
+    ops.push(JsOperation::SetAttribute {
+        target: NodeRef(0),
+        attr_name: AttrName::ContentEditable,
+        attr_value: String8("true".to_string()),
+    });
+    ops.push(JsOperation::FocusNode { target: NodeRef(0) });
+    ops.push(JsOperation::SelectAllContent);
+    for _ in 0..u.int_in_range(3..=8)? {
+        let cmd: ExecCommandType = u.arbitrary().unwrap_or(ExecCommandType::Delete);
+        ops.push(JsOperation::ExecCommand { command: cmd });
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(0) });
+    }
+    ops.push(JsOperation::ForceGC);
+
+    ops = wrap_in_timing_chain(u, ops)?;
+
+    Ok(ops)
+}
+
+/// Observer cascade: set up MutationObserver + ResizeObserver + IntersectionObserver,
+/// then trigger mutations that cause cascading callbacks with layout forcing.
+fn generate_observer_cascade(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::with_capacity(200);
+
+    // Setup: create complex layout state
+    for i in 0..u.int_in_range(5..=10)? {
+        let target = NodeRef(i as u16);
+        ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: pick_dangerous_css(u)?,
+        });
+    }
+
+    // Force initial layout
+    for i in 0..5u16 {
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+    }
+
+    // Set up multiple observers with callbacks that mutate the DOM
+    for i in 0..u.int_in_range(2..=4)? {
+        let target = NodeRef(i as u16 * 3);
+        let mutate_target = NodeRef(i as u16 * 3 + 1);
+
+        // MutationObserver: observe and mutate in callback
+        ops.push(JsOperation::ObserveAndMutate {
+            observe_target: target,
+            mutate_target,
+            mutation_op: u.arbitrary().unwrap_or(MutationOp::SetInnerHTML),
+        });
+
+        // ResizeObserver: force layout in callback (re-entrant layout)
+        ops.push(JsOperation::ResizeObserverObserve {
+            target,
+            callback_ops: vec![
+                JsOperation::SetInlineStyle {
+                    target: mutate_target,
+                    property: CssProperty::Width(LengthOrAuto::Length(LengthValue::Px(
+                        (i * 100 + 50) as i32,
+                    ))),
+                },
+                JsOperation::GetOffsetWidth { target: mutate_target },
+                JsOperation::ForceGC,
+            ],
+        });
+
+        // IntersectionObserver: remove nodes in callback
+        ops.push(JsOperation::IntersectionObserverObserve {
+            target,
+            callback_ops: vec![
+                JsOperation::RemoveChild { target: mutate_target },
+                JsOperation::GetOffsetWidth { target: mutate_target },
+            ],
+        });
+    }
+
+    // Now trigger all the observers by mutating the observed nodes
+    for i in 0..u.int_in_range(10..=30)? {
+        let target = NodeRef((i % 12) as u16);
+        match try_gen_mutation(u) {
+            Some(op) => ops.push(op),
+            None => break,
+        }
+        ops.push(JsOperation::GetOffsetWidth { target });
+
+        if i % 5 == 0 {
+            ops.push(JsOperation::ForceGC);
+        }
+    }
+
+    // ScrollIntoView to trigger IntersectionObserver callbacks
+    for i in 0..u.int_in_range(3..=6)? {
+        let target = NodeRef(i as u16);
+        ops.push(JsOperation::ScrollIntoView { target });
+        ops.push(JsOperation::GetOffsetWidth { target });
+    }
+
+    // Resize elements to trigger ResizeObserver callbacks
+    for i in 0..u.int_in_range(3..=6)? {
+        let target = NodeRef(i as u16 * 3);
+        ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: CssProperty::Width(LengthOrAuto::Length(LengthValue::Px(
+                (i * 200 + 1) as i32,
+            ))),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target });
+    }
+
+    // Final GC + stale access
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::ForceGC);
+    for i in 0..15u16 {
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+    }
+
+    ops = wrap_in_timing_chain(u, ops)?;
+
+    Ok(ops)
+}
+
+// ============================
+// HELPER FUNCTIONS
+// ============================
+
+/// Pick CSS properties that are most likely to trigger layout bugs.
+fn pick_dangerous_css(u: &mut Unstructured) -> arbitrary::Result<CssProperty> {
+    let choice: u8 = u.int_in_range(0..=19)?;
+    Ok(match choice {
+        0 => CssProperty::Display(DisplayValue::None),
+        1 => CssProperty::Display(DisplayValue::Contents),
+        2 => CssProperty::Display(DisplayValue::Grid),
+        3 => CssProperty::Display(DisplayValue::Flex),
+        4 => CssProperty::Display(DisplayValue::Table),
+        5 => CssProperty::Display(DisplayValue::InlineGrid),
+        6 => CssProperty::ContentVisibility(ContentVisibilityValue::Hidden),
+        7 => CssProperty::ContentVisibility(ContentVisibilityValue::Auto),
+        8 => CssProperty::Contain(ContainValue::Strict),
+        9 => CssProperty::Contain(ContainValue::Content),
+        10 => CssProperty::Position(PositionValue::Fixed),
+        11 => CssProperty::Position(PositionValue::Absolute),
+        12 => CssProperty::Position(PositionValue::Sticky),
+        13 => CssProperty::Overflow(OverflowValue::Hidden),
+        14 => CssProperty::Visibility(VisibilityValue::Collapse),
+        15 => CssProperty::Width(LengthOrAuto::Length(LengthValue::Zero)),
+        16 => CssProperty::Height(LengthOrAuto::Length(LengthValue::Zero)),
+        17 => CssProperty::Opacity(OpacityValue(0)),
+        18 => CssProperty::Transform(TransformList {
+            transforms: vec![TransformFunction::Scale(0, 0)],
+        }),
+        _ => CssProperty::ColumnCount(ColumnCountValue::Number(u.int_in_range(1..=5)?)),
+    })
+}
+
+/// Try to generate an arbitrary JsOperation, returning None if bytes exhausted.
+fn try_gen(u: &mut Unstructured) -> Option<JsOperation> {
+    u.arbitrary().ok()
+}
+
+/// Try to generate a mutation-focused JsOperation.
+fn try_gen_mutation(u: &mut Unstructured) -> Option<JsOperation> {
+    let choice: u8 = u.int_in_range(0..=18).ok()?;
+    let target = try_node(u)?;
+    Some(match choice {
+        0 => JsOperation::RemoveChild { target },
+        1 => {
+            let parent = try_node(u)?;
+            JsOperation::AppendChild {
+                parent,
+                child: target,
+            }
+        }
+        2 => JsOperation::SetInnerHTML {
+            target,
+            html: u.arbitrary().ok()?,
+        },
+        3 => JsOperation::SetInlineStyle {
+            target,
+            property: pick_dangerous_css(u).ok()?,
+        },
+        4 => JsOperation::CloneNode {
+            source: target,
+            deep: true,
+            append_to: try_node(u)?,
+        },
+        5 => JsOperation::AdoptNode { target },
+        6 => JsOperation::InsertAdjacentHTML {
+            target,
+            position: u.arbitrary().ok()?,
+            html: u.arbitrary().ok()?,
+        },
+        7 => {
+            let start = try_node(u)?;
+            JsOperation::RangeDeleteContents {
+                start_node: start,
+                end_node: target,
+            }
+        }
+        8 => JsOperation::ReplaceWith {
+            target,
+            html: u.arbitrary().ok()?,
+        },
+        9 => JsOperation::SetTextContent {
+            target,
+            text: u.arbitrary().ok()?,
+        },
+        10 => {
+            let parent = try_node(u)?;
+            let ref_child = try_node(u)?;
+            JsOperation::InsertBefore {
+                parent,
+                new_child: target,
+                ref_child,
+            }
+        }
+        11 => JsOperation::ReplaceChildren {
+            target,
+            html: u.arbitrary().ok()?,
+        },
+        12 => JsOperation::Normalize { target },
+        13 => JsOperation::CreateElement {
+            parent: target,
+            tag: u.arbitrary().ok()?,
+        },
+        14 => JsOperation::ToggleClass {
+            target,
+            class_name: u.arbitrary().ok()?,
+        },
+        15 => JsOperation::SetAttribute {
+            target,
+            attr_name: u.arbitrary().ok()?,
+            attr_value: u.arbitrary().ok()?,
+        },
+        16 => JsOperation::RemoveAttribute {
+            target,
+            attr_name: u.arbitrary().ok()?,
+        },
+        17 => JsOperation::ShadowRootSetInnerHTML {
+            host: target,
+            html: u.arbitrary().ok()?,
+        },
+        _ => JsOperation::ScrollIntoView { target },
+    })
+}
+
+/// Try to generate a NodeRef.
+fn try_node(u: &mut Unstructured) -> Option<NodeRef> {
+    u.arbitrary().ok()
+}
+
+/// Append a burst of stale reference accesses after GC.
+fn append_stale_ref_burst(
+    u: &mut Unstructured,
+    ops: &mut Vec<JsOperation>,
+) -> arbitrary::Result<()> {
+    // Double GC to ensure memory is freed
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::ForceGC);
+
+    // Access many nodes — some may have been freed
+    let count = u.int_in_range(10..=25).unwrap_or(15);
+    for i in 0..count as u16 {
+        ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+        if i % 3 == 0 {
+            ops.push(JsOperation::GetBoundingClientRect { target: NodeRef(i) });
+        }
+        if i % 5 == 0 {
+            ops.push(JsOperation::GetScrollMetrics { target: NodeRef(i) });
+        }
+        if i % 7 == 0 {
+            ops.push(JsOperation::TreeWalkerTraverse { root: NodeRef(i) });
+        }
+    }
+
+    Ok(())
+}
+
+/// Wrap operations in a timing chain: split into chunks, nest in rAF/microtask/setTimeout.
+fn wrap_in_timing_chain(
+    _u: &mut Unstructured,
+    ops: Vec<JsOperation>,
+) -> arbitrary::Result<Vec<JsOperation>> {
+    if ops.len() < 20 {
+        return Ok(ops);
+    }
+
+    // Split ops into 4 chunks
+    let chunk_size = ops.len() / 4;
+    let mut chunks: Vec<Vec<JsOperation>> = Vec::new();
+    for chunk in ops.chunks(chunk_size.max(1)) {
+        chunks.push(chunk.to_vec());
+    }
+
+    let mut result = Vec::new();
+
+    // Chunk 0: runs immediately
+    if let Some(chunk) = chunks.get(0) {
+        result.extend_from_slice(chunk);
+    }
+
+    // Chunk 1 in rAF
+    if let Some(chunk1) = chunks.get(1) {
+        let mut raf_ops = chunk1.clone();
+        raf_ops.push(JsOperation::ForceGC);
+
+        // Chunk 2 in nested rAF inside rAF
+        if let Some(chunk2) = chunks.get(2) {
+            let mut inner_raf = chunk2.clone();
+
+            // Chunk 3 in microtask inside nested rAF
+            if let Some(chunk3) = chunks.get(3) {
+                let mut micro_ops = chunk3.clone();
+                // Final stale access inside microtask
+                for i in 0..5u16 {
+                    micro_ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i) });
+                }
+                micro_ops.push(JsOperation::ForceGC);
+                inner_raf.push(JsOperation::QueueMicrotask {
+                    operations: micro_ops,
+                });
+            }
+
+            raf_ops.push(JsOperation::RequestAnimationFrame {
+                operations: inner_raf,
+            });
+        }
+
+        result.push(JsOperation::RequestAnimationFrame {
+            operations: raf_ops,
+        });
+    }
+
+    // Also launch a parallel setTimeout chain for concurrent access
+    let mut timeout_ops = Vec::new();
+    for i in 0..8u16 {
+        timeout_ops.push(JsOperation::GetOffsetWidth { target: NodeRef(i * 2) });
+    }
+    timeout_ops.push(JsOperation::ForceGC);
+    for i in 0..8u16 {
+        timeout_ops.push(JsOperation::GetBoundingClientRect { target: NodeRef(i * 2 + 1) });
+    }
+    result.push(JsOperation::SetTimeout {
+        delay_ms: 0,
+        operations: timeout_ops,
+    });
+
+    Ok(result)
+}
+
+// ============================
+// DOM, CSS, KEYFRAMES, AT-RULES GENERATION
+// ============================
+
 fn generate_font_faces(u: &mut Unstructured) -> arbitrary::Result<Vec<FontFaceDecl>> {
-    let count = u.int_in_range(0..=4)?;
+    let count = u.int_in_range(1..=5)?;
     let mut faces = Vec::with_capacity(count);
     for _ in 0..count {
         faces.push(u.arbitrary()?);
@@ -113,105 +797,25 @@ fn generate_font_faces(u: &mut Unstructured) -> arbitrary::Result<Vec<FontFaceDe
     Ok(faces)
 }
 
-/// Phase 1: Generate @keyframes rules for every animation declaration in CSS rules.
-fn generate_keyframes(
-    u: &mut Unstructured,
-    css_rules: &[CssRule],
-) -> arbitrary::Result<Vec<KeyframesRule>> {
-    let mut keyframes = Vec::new();
-
-    for rule in css_rules {
-        for decl in &rule.declarations {
-            if let CssProperty::Animation(anim) = &decl.property {
-                let stop_count = u.int_in_range(2..=5)?;
-                let mut stops = Vec::with_capacity(stop_count);
-
-                for j in 0..stop_count {
-                    let offset = if j == 0 {
-                        KeyframeOffset::From
-                    } else if j == stop_count - 1 {
-                        KeyframeOffset::To
-                    } else {
-                        KeyframeOffset::Percent(
-                            ((j as u16 * 100) / (stop_count as u16 - 1)).min(100) as u8,
-                        )
-                    };
-
-                    // Generate declarations that mutate layout-sensitive properties
-                    let decl_count = u.int_in_range(1..=4)?;
-                    let mut declarations = Vec::with_capacity(decl_count);
-                    for _ in 0..decl_count {
-                        let prop = generate_keyframe_property(u)?;
-                        declarations.push(CssDeclaration {
-                            property: prop,
-                            important: false,
-                        });
-                    }
-
-                    stops.push(Keyframe {
-                        offset,
-                        declarations,
-                    });
-                }
-
-                keyframes.push(KeyframesRule {
-                    name: anim.name.clone(),
-                    keyframes: stops,
-                });
-            }
-        }
-    }
-
-    Ok(keyframes)
-}
-
-/// Generate properties that are interesting to animate for bug-finding.
-fn generate_keyframe_property(u: &mut Unstructured) -> arbitrary::Result<CssProperty> {
-    let choice: u8 = u.int_in_range(0..=9)?;
-    Ok(match choice {
-        0 => CssProperty::Display(u.arbitrary()?),
-        1 => CssProperty::Width(u.arbitrary()?),
-        2 => CssProperty::Height(u.arbitrary()?),
-        3 => CssProperty::Transform(u.arbitrary()?),
-        4 => CssProperty::ContentVisibility(u.arbitrary()?),
-        5 => CssProperty::FontSize(u.arbitrary()?),
-        6 => CssProperty::Opacity(u.arbitrary()?),
-        7 => CssProperty::Visibility(u.arbitrary()?),
-        8 => CssProperty::Position(u.arbitrary()?),
-        _ => CssProperty::Overflow(u.arbitrary()?),
-    })
-}
-
-/// Phase 8: Generate at-rules wrapping CSS rules.
-fn generate_at_rules(u: &mut Unstructured) -> arbitrary::Result<Vec<AtRule>> {
-    let count = u.int_in_range(0..=2)?;
-    let mut rules = Vec::with_capacity(count);
-    for _ in 0..count {
-        rules.push(u.arbitrary()?);
-    }
-    Ok(rules)
-}
-
-/// Phase 2: generate larger DOM trees with configurable shape.
+/// Generate a large DOM tree for maximum crash surface.
 fn generate_dom(u: &mut Unstructured) -> arbitrary::Result<DomTree> {
-    // 10% wide tree mode, 10% deep tree mode, 80% normal
     let mode: u8 = u.int_in_range(0..=9)?;
 
     let (root_count, max_depth, max_children) = match mode {
         0 => {
-            // Wide tree: 30-50 root children, depth 2
-            let count = u.int_in_range(30..=50)?;
+            // Wide tree: 30-60 root children
+            let count = u.int_in_range(30..=60)?;
             (count, 2usize, 2usize)
         }
         1 => {
-            // Deep tree: depth 7, 1-2 children/level
+            // Deep tree: depth 8, narrow
             let count = u.int_in_range(1..=3)?;
-            (count, 7usize, 2usize)
+            (count, 8usize, 2usize)
         }
         _ => {
-            // Normal: 3-20 root children, depth 5, 0-5 children
-            let count = u.int_in_range(3..=20)?;
-            (count, 5usize, 5usize)
+            // Normal large: 8-25 root children, depth 5-6
+            let count = u.int_in_range(8..=25)?;
+            (count, 5usize, 4usize)
         }
     };
 
@@ -259,23 +863,21 @@ fn generate_css_rules(
     u: &mut Unstructured,
     font_faces: &[FontFaceDecl],
 ) -> arbitrary::Result<Vec<CssRule>> {
-    let count = u.int_in_range(1..=12)?;
+    let count = u.int_in_range(5..=15)?;
     let mut rules = Vec::with_capacity(count);
 
     for _ in 0..count {
         let selector: Selector = u.arbitrary()?;
-        let decl_count = u.int_in_range(1..=6)?;
+        let decl_count = u.int_in_range(2..=7)?;
         let mut declarations = Vec::with_capacity(decl_count);
 
         for _ in 0..decl_count {
-            // Sometimes use boundary values
             let property = if u.ratio(1, 3)? {
                 generate_boundary_property(u)?
             } else {
                 u.arbitrary()?
             };
 
-            // Cross-reference font families from font_faces
             let property = if !font_faces.is_empty() && u.ratio(1, 4)? {
                 let face_idx = u.int_in_range(0..=font_faces.len() - 1)?;
                 CssProperty::FontFamily(FontFamilyValue::Named(String8(
@@ -304,740 +906,143 @@ fn generate_boundary_property(u: &mut Unstructured) -> arbitrary::Result<CssProp
     let choice: u8 = u.int_in_range(0..=15)?;
     Ok(match choice {
         0 => {
-            let values = boundary::boundary_font_sizes();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::FontSize(values[idx].clone())
+            let v = boundary::boundary_font_sizes();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::FontSize(v[i].clone())
         }
         1 => {
-            let values = boundary::boundary_displays();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Display(values[idx])
+            let v = boundary::boundary_displays();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Display(v[i])
         }
         2 => {
-            let values = boundary::boundary_positions();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Position(values[idx])
+            let v = boundary::boundary_positions();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Position(v[i])
         }
         3 => {
-            let values = boundary::boundary_content_visibilities();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::ContentVisibility(values[idx])
+            let v = boundary::boundary_content_visibilities();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::ContentVisibility(v[i])
         }
         4 => {
-            let values = boundary::boundary_contains();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Contain(values[idx])
+            let v = boundary::boundary_contains();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Contain(v[i])
         }
         5 => {
-            let values = boundary::boundary_font_weights();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::FontWeight(values[idx].clone())
+            let v = boundary::boundary_font_weights();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::FontWeight(v[i].clone())
         }
         6 => {
-            let values = boundary::boundary_z_indices();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::ZIndex(values[idx].clone())
+            let v = boundary::boundary_z_indices();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::ZIndex(v[i].clone())
         }
         7 => {
-            let values = boundary::boundary_dimensions();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Width(values[idx].clone())
+            let v = boundary::boundary_dimensions();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Width(v[i].clone())
         }
         8 => {
-            let values = boundary::boundary_opacities();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Opacity(values[idx].clone())
+            let v = boundary::boundary_opacities();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Opacity(v[i].clone())
         }
         9 => {
-            let values = boundary::boundary_will_changes();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::WillChange(values[idx])
+            let v = boundary::boundary_will_changes();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::WillChange(v[i])
         }
-        // Phase 6: new boundary properties
         10 => {
-            let values = boundary::boundary_border_widths();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::BorderWidth(values[idx].clone())
+            let v = boundary::boundary_border_widths();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::BorderWidth(v[i].clone())
         }
         11 => {
-            let values = boundary::boundary_border_radii();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::BorderRadius(values[idx].clone())
+            let v = boundary::boundary_border_radii();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::BorderRadius(v[i].clone())
         }
         12 => {
-            let values = boundary::boundary_colors();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::Color(values[idx].clone())
+            let v = boundary::boundary_colors();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::Color(v[i].clone())
         }
         13 => {
-            let values = boundary::boundary_colors();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::BackgroundColor(values[idx].clone())
+            let v = boundary::boundary_colors();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::BackgroundColor(v[i].clone())
         }
         14 => {
-            let values = boundary::boundary_border_styles();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
-            CssProperty::BorderStyle(values[idx])
+            let v = boundary::boundary_border_styles();
+            let i = u.int_in_range(0..=v.len() - 1)?;
+            CssProperty::BorderStyle(v[i])
         }
         _ => {
-            let values = boundary::boundary_global_keywords();
-            let idx = u.int_in_range(0..=values.len() - 1)?;
+            let v = boundary::boundary_global_keywords();
+            let i = u.int_in_range(0..=v.len() - 1)?;
             let prop: CssPropertyName = u.arbitrary()?;
-            CssProperty::GlobalReset(prop, values[idx])
+            CssProperty::GlobalReset(prop, v[i])
         }
     })
 }
 
-fn generate_script(
+fn generate_keyframes(
     u: &mut Unstructured,
-    pattern: &TemplatePattern,
-    font_faces: &[FontFaceDecl],
-) -> arbitrary::Result<Vec<JsOperation>> {
-    match pattern {
-        TemplatePattern::FontLoadRemove => generate_font_load_remove(u, font_faces),
-        TemplatePattern::StyleRecalcAnimation => generate_style_recalc_animation(u),
-        TemplatePattern::ContentVisibilityToggle => generate_content_visibility_toggle(u),
-        TemplatePattern::GridRelayoutFontSwap => generate_grid_relayout_font_swap(u, font_faces),
-        TemplatePattern::RandomMix => generate_random_mix(u),
-        TemplatePattern::DomTreeStress => generate_dom_tree_stress(u),
-        TemplatePattern::FontFaceChurn => generate_font_face_churn(u, font_faces),
-        TemplatePattern::DisplayToggle => generate_display_toggle(u),
-        // Phase 5: new templates
-        TemplatePattern::OperationStorm => generate_operation_storm(u),
-        TemplatePattern::StateMachine => generate_state_machine(u),
-        TemplatePattern::MultiFrameChain => generate_multi_frame_chain(u),
-        TemplatePattern::ShadowDomStress => generate_shadow_dom_stress(u),
-        TemplatePattern::ObserverTrigger => generate_observer_trigger(u),
-        TemplatePattern::IframeCycle => generate_iframe_cycle(u),
-        TemplatePattern::EditingStress => generate_editing_stress(u),
-        TemplatePattern::CrossElementInteraction => generate_cross_element_interaction(u),
-    }
-}
+    css_rules: &[CssRule],
+) -> arbitrary::Result<Vec<KeyframesRule>> {
+    let mut keyframes = Vec::new();
 
-/// Font load + DOM removal during callback.
-fn generate_font_load_remove(
-    u: &mut Unstructured,
-    font_faces: &[FontFaceDecl],
-) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
+    for rule in css_rules {
+        for decl in &rule.declarations {
+            if let CssProperty::Animation(anim) = &decl.property {
+                let stop_count = u.int_in_range(2..=5)?;
+                let mut stops = Vec::with_capacity(stop_count);
 
-    for face in font_faces {
-        ops.push(JsOperation::FontFaceLoad {
-            family: String8(face.family.0.clone()),
-        });
-    }
+                for j in 0..stop_count {
+                    let offset = if j == 0 {
+                        KeyframeOffset::From
+                    } else if j == stop_count - 1 {
+                        KeyframeOffset::To
+                    } else {
+                        KeyframeOffset::Percent(
+                            ((j as u16 * 100) / (stop_count as u16 - 1)).min(100) as u8,
+                        )
+                    };
 
-    let target: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::GetOffsetWidth { target });
+                    let decl_count = u.int_in_range(1..=4)?;
+                    let mut declarations = Vec::with_capacity(decl_count);
+                    for _ in 0..decl_count {
+                        declarations.push(CssDeclaration {
+                            property: pick_dangerous_css(u)?,
+                            important: false,
+                        });
+                    }
 
-    let remove_target: NodeRef = u.arbitrary()?;
-    let layout_target: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::RequestAnimationFrame {
-        operations: vec![
-            JsOperation::RemoveChild {
-                target: remove_target,
-            },
-            JsOperation::ForceGC,
-            JsOperation::GetOffsetWidth {
-                target: layout_target,
-            },
-        ],
-    });
+                    stops.push(Keyframe {
+                        offset,
+                        declarations,
+                    });
+                }
 
-    let extra_count = u.int_in_range(0..=3)?;
-    for _ in 0..extra_count {
-        ops.push(u.arbitrary()?);
-    }
-
-    Ok(ops)
-}
-
-/// Style recalc during animation frame.
-fn generate_style_recalc_animation(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let target: NodeRef = u.arbitrary()?;
-    let property: CssProperty = u.arbitrary()?;
-
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: property.clone(),
-    });
-
-    let new_property: CssProperty = u.arbitrary()?;
-    let layout_target: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::RequestAnimationFrame {
-        operations: vec![
-            JsOperation::SetInlineStyle {
-                target,
-                property: new_property,
-            },
-            JsOperation::GetOffsetWidth {
-                target: layout_target,
-            },
-            JsOperation::ForceGC,
-        ],
-    });
-
-    let another_prop: CssProperty = u.arbitrary()?;
-    ops.push(JsOperation::RequestAnimationFrame {
-        operations: vec![JsOperation::RequestAnimationFrame {
-            operations: vec![
-                JsOperation::SetInlineStyle {
-                    target,
-                    property: another_prop,
-                },
-                JsOperation::GetBoundingClientRect { target },
-            ],
-        }],
-    });
-
-    Ok(ops)
-}
-
-/// ContentVisibility toggle + forced layout.
-fn generate_content_visibility_toggle(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-    let target: NodeRef = u.arbitrary()?;
-
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::ContentVisibility(ContentVisibilityValue::Auto),
-    });
-    ops.push(JsOperation::GetOffsetWidth { target });
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::ContentVisibility(ContentVisibilityValue::Hidden),
-    });
-    ops.push(JsOperation::GetOffsetHeight { target });
-    ops.push(JsOperation::SetTimeout {
-        delay_ms: 0,
-        operations: vec![
-            JsOperation::SetInlineStyle {
-                target,
-                property: CssProperty::ContentVisibility(ContentVisibilityValue::Visible),
-            },
-            JsOperation::GetBoundingClientRect { target },
-            JsOperation::ForceGC,
-        ],
-    });
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::Contain(ContainValue::Strict),
-    });
-    ops.push(JsOperation::GetOffsetWidth { target });
-
-    let extra: usize = u.int_in_range(0..=2)?;
-    for _ in 0..extra {
-        ops.push(u.arbitrary()?);
-    }
-
-    Ok(ops)
-}
-
-/// Grid/flex relayout during font swap.
-fn generate_grid_relayout_font_swap(
-    u: &mut Unstructured,
-    font_faces: &[FontFaceDecl],
-) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-    let target: NodeRef = u.arbitrary()?;
-
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::Display(DisplayValue::Grid),
-    });
-
-    let template: GridTemplateValue = u.arbitrary()?;
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::GridTemplateColumns(template),
-    });
-
-    if let Some(face) = font_faces.first() {
-        ops.push(JsOperation::SetInlineStyle {
-            target,
-            property: CssProperty::FontFamily(FontFamilyValue::Named(String8(
-                face.family.0.clone(),
-            ))),
-        });
-    }
-
-    ops.push(JsOperation::GetOffsetWidth { target });
-
-    let child: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::RequestAnimationFrame {
-        operations: vec![
-            JsOperation::SetInlineStyle {
-                target,
-                property: CssProperty::FontFamily(FontFamilyValue::SansSerif),
-            },
-            JsOperation::GetOffsetWidth { target: child },
-            JsOperation::SetInlineStyle {
-                target,
-                property: CssProperty::Display(DisplayValue::Flex),
-            },
-            JsOperation::GetBoundingClientRect { target },
-            JsOperation::ForceGC,
-        ],
-    });
-
-    Ok(ops)
-}
-
-/// Random mix of operations.
-fn generate_random_mix(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let count = u.int_in_range(2..=12)?;
-    let mut ops = Vec::with_capacity(count);
-    for _ in 0..count {
-        ops.push(u.arbitrary()?);
-    }
-    Ok(ops)
-}
-
-/// DOM tree manipulation stress.
-fn generate_dom_tree_stress(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let count = u.int_in_range(3..=8)?;
-    for _ in 0..count {
-        let choice: u8 = u.int_in_range(0..=6)?;
-        let op = match choice {
-            0 => JsOperation::AppendChild {
-                parent: u.arbitrary()?,
-                child: u.arbitrary()?,
-            },
-            1 => JsOperation::RemoveChild {
-                target: u.arbitrary()?,
-            },
-            2 => JsOperation::CloneNode {
-                source: u.arbitrary()?,
-                deep: u.arbitrary()?,
-                append_to: u.arbitrary()?,
-            },
-            3 => JsOperation::SetInnerHTML {
-                target: u.arbitrary()?,
-                html: u.arbitrary()?,
-            },
-            4 => JsOperation::RangeDeleteContents {
-                start_node: u.arbitrary()?,
-                end_node: u.arbitrary()?,
-            },
-            5 => JsOperation::InsertBefore {
-                parent: u.arbitrary()?,
-                new_child: u.arbitrary()?,
-                ref_child: u.arbitrary()?,
-            },
-            _ => JsOperation::ReplaceChild {
-                parent: u.arbitrary()?,
-                new_child: u.arbitrary()?,
-                old_child: u.arbitrary()?,
-            },
-        };
-        ops.push(op);
-
-        if u.ratio(1, 2)? {
-            ops.push(JsOperation::GetOffsetWidth {
-                target: u.arbitrary()?,
-            });
+                keyframes.push(KeyframesRule {
+                    name: anim.name.clone(),
+                    keyframes: stops,
+                });
+            }
         }
     }
 
-    ops.push(JsOperation::ForceGC);
-    ops.push(JsOperation::GetOffsetWidth {
-        target: u.arbitrary()?,
-    });
-
-    Ok(ops)
+    Ok(keyframes)
 }
 
-/// Font face API churn.
-fn generate_font_face_churn(
-    u: &mut Unstructured,
-    font_faces: &[FontFaceDecl],
-) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let count = u.int_in_range(2..=6)?;
+fn generate_at_rules(u: &mut Unstructured) -> arbitrary::Result<Vec<AtRule>> {
+    let count = u.int_in_range(0..=3)?;
+    let mut rules = Vec::with_capacity(count);
     for _ in 0..count {
-        let family: String8 = u.arbitrary()?;
-        let source: FontFaceSource = u.arbitrary()?;
-
-        ops.push(JsOperation::FontFaceAdd {
-            family: family.clone(),
-            source,
-        });
-        ops.push(JsOperation::FontFaceLoad {
-            family: family.clone(),
-        });
-        ops.push(JsOperation::GetOffsetWidth {
-            target: u.arbitrary()?,
-        });
-        ops.push(JsOperation::FontFaceRemove { family });
-        ops.push(JsOperation::ForceGC);
+        rules.push(u.arbitrary()?);
     }
-
-    for face in font_faces {
-        ops.push(JsOperation::FontFaceLoad {
-            family: String8(face.family.0.clone()),
-        });
-    }
-
-    Ok(ops)
-}
-
-/// Rapid display toggling.
-fn generate_display_toggle(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-    let target: NodeRef = u.arbitrary()?;
-    let displays = boundary::boundary_displays();
-
-    for display in &displays {
-        ops.push(JsOperation::SetInlineStyle {
-            target,
-            property: CssProperty::Display(*display),
-        });
-        ops.push(JsOperation::GetOffsetWidth { target });
-    }
-
-    let raf_target: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::RequestAnimationFrame {
-        operations: vec![
-            JsOperation::SetInlineStyle {
-                target: raf_target,
-                property: CssProperty::Display(DisplayValue::None),
-            },
-            JsOperation::ForceGC,
-            JsOperation::SetInlineStyle {
-                target: raf_target,
-                property: CssProperty::Display(DisplayValue::Contents),
-            },
-            JsOperation::GetBoundingClientRect {
-                target: raf_target,
-            },
-        ],
-    });
-
-    Ok(ops)
-}
-
-// ============================
-// Phase 5: New template patterns
-// ============================
-
-/// OperationStorm: 30-80 rapid-fire random ops + forced layout + GC.
-fn generate_operation_storm(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let count = u.int_in_range(30..=80)?;
-    let mut ops = Vec::with_capacity(count + 2);
-
-    for _ in 0..count {
-        ops.push(u.arbitrary()?);
-    }
-
-    // Force layout after storm
-    ops.push(JsOperation::GetOffsetWidth {
-        target: u.arbitrary()?,
-    });
-    ops.push(JsOperation::ForceGC);
-    ops.push(JsOperation::GetBoundingClientRect {
-        target: u.arbitrary()?,
-    });
-
-    Ok(ops)
-}
-
-/// StateMachine: create complex state -> mutate -> layout -> destroy -> layout stale ref -> re-create via innerHTML.
-fn generate_state_machine(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let target: NodeRef = u.arbitrary()?;
-    let child: NodeRef = u.arbitrary()?;
-
-    // Create complex state
-    ops.push(JsOperation::SetInlineStyle {
-        target,
-        property: CssProperty::Display(DisplayValue::Grid),
-    });
-    ops.push(JsOperation::AppendChild {
-        parent: target,
-        child,
-    });
-    ops.push(JsOperation::SetInlineStyle {
-        target: child,
-        property: CssProperty::ContentVisibility(ContentVisibilityValue::Auto),
-    });
-
-    // Mutate
-    ops.push(JsOperation::SetInnerHTML {
-        target: child,
-        html: u.arbitrary()?,
-    });
-    ops.push(JsOperation::GetOffsetWidth { target });
-
-    // Destroy
-    ops.push(JsOperation::RemoveChild { target: child });
-    ops.push(JsOperation::ForceGC);
-
-    // Layout stale reference
-    ops.push(JsOperation::GetOffsetWidth { target: child });
-    ops.push(JsOperation::GetBoundingClientRect { target });
-
-    // Re-create via innerHTML
-    ops.push(JsOperation::SetInnerHTML {
-        target,
-        html: u.arbitrary()?,
-    });
-    ops.push(JsOperation::GetOffsetWidth { target });
-    ops.push(JsOperation::ForceGC);
-
-    Ok(ops)
-}
-
-/// MultiFrameChain: 3-6 nested rAF with different ops each frame.
-fn generate_multi_frame_chain(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let depth = u.int_in_range(3..=6)?;
-    let target: NodeRef = u.arbitrary()?;
-
-    // Build from inside out
-    let mut inner_ops: Vec<JsOperation> = vec![
-        JsOperation::ForceGC,
-        JsOperation::GetOffsetWidth { target },
-    ];
-
-    for _ in 0..depth {
-        let prop: CssProperty = u.arbitrary()?;
-        let mut frame_ops = vec![
-            JsOperation::SetInlineStyle {
-                target,
-                property: prop,
-            },
-            JsOperation::GetOffsetWidth { target },
-        ];
-        frame_ops.push(JsOperation::RequestAnimationFrame {
-            operations: inner_ops,
-        });
-        inner_ops = frame_ops;
-    }
-
-    Ok(vec![JsOperation::RequestAnimationFrame {
-        operations: inner_ops,
-    }])
-}
-
-/// ShadowDomStress: attachShadow + innerHTML + remove host + layout.
-fn generate_shadow_dom_stress(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let host: NodeRef = u.arbitrary()?;
-    let mode: ShadowRootMode = u.arbitrary()?;
-
-    // Attach shadow root
-    ops.push(JsOperation::AttachShadowRoot {
-        target: host,
-        mode,
-    });
-
-    // Set shadow root innerHTML
-    ops.push(JsOperation::ShadowRootSetInnerHTML {
-        host,
-        html: u.arbitrary()?,
-    });
-
-    // Force layout
-    ops.push(JsOperation::GetOffsetWidth { target: host });
-
-    // Mutate shadow content
-    ops.push(JsOperation::ShadowRootSetInnerHTML {
-        host,
-        html: u.arbitrary()?,
-    });
-    ops.push(JsOperation::GetBoundingClientRect { target: host });
-
-    // Remove host
-    ops.push(JsOperation::RemoveChild { target: host });
-    ops.push(JsOperation::ForceGC);
-
-    // Layout stale reference
-    ops.push(JsOperation::GetOffsetWidth { target: host });
-
-    let extra: usize = u.int_in_range(0..=3)?;
-    for _ in 0..extra {
-        ops.push(u.arbitrary()?);
-    }
-
-    Ok(ops)
-}
-
-/// ObserverTrigger: MutationObserver observe, then mutate observed tree in callback.
-fn generate_observer_trigger(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let observe_target: NodeRef = u.arbitrary()?;
-    let mutate_target: NodeRef = u.arbitrary()?;
-
-    // Observe and mutate
-    ops.push(JsOperation::ObserveAndMutate {
-        observe_target,
-        mutate_target,
-        mutation_op: u.arbitrary()?,
-    });
-
-    // Force layout
-    ops.push(JsOperation::GetOffsetWidth {
-        target: observe_target,
-    });
-
-    // Additional mutations
-    ops.push(JsOperation::SetInnerHTML {
-        target: mutate_target,
-        html: u.arbitrary()?,
-    });
-    ops.push(JsOperation::GetBoundingClientRect {
-        target: observe_target,
-    });
-
-    // ResizeObserver
-    let resize_target: NodeRef = u.arbitrary()?;
-    ops.push(JsOperation::ResizeObserverObserve {
-        target: resize_target,
-        callback_ops: vec![
-            JsOperation::SetInlineStyle {
-                target: resize_target,
-                property: CssProperty::Width(LengthOrAuto::Length(LengthValue::Px(200))),
-            },
-            JsOperation::GetOffsetWidth {
-                target: resize_target,
-            },
-        ],
-    });
-
-    // Trigger resize
-    ops.push(JsOperation::SetInlineStyle {
-        target: resize_target,
-        property: CssProperty::Width(LengthOrAuto::Length(LengthValue::Px(100))),
-    });
-
-    ops.push(JsOperation::ForceGC);
-
-    Ok(ops)
-}
-
-/// IframeCycle: create iframe -> mutate content -> remove iframe -> layout -> GC.
-fn generate_iframe_cycle(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let count = u.int_in_range(2..=4)?;
-    for _ in 0..count {
-        let target: NodeRef = u.arbitrary()?;
-
-        // Create iframe
-        ops.push(JsOperation::CreateIframe {
-            target,
-            src_html: u.arbitrary()?,
-        });
-        ops.push(JsOperation::GetOffsetWidth { target });
-
-        // Remove iframe
-        ops.push(JsOperation::RemoveIframe { target });
-        ops.push(JsOperation::ForceGC);
-        ops.push(JsOperation::GetOffsetWidth { target });
-    }
-
-    Ok(ops)
-}
-
-/// EditingStress: contentEditable + execCommand + forced layout.
-fn generate_editing_stress(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let target: NodeRef = u.arbitrary()?;
-
-    // Make element contentEditable
-    ops.push(JsOperation::SetAttribute {
-        target,
-        attr_name: AttrName::ContentEditable,
-        attr_value: String8("true".to_string()),
-    });
-
-    // Focus it
-    ops.push(JsOperation::DispatchEvent {
-        target,
-        event_type: EventType::Focus,
-    });
-
-    // Select all content
-    ops.push(JsOperation::SelectAllContent);
-
-    // Execute various commands
-    let cmd_count = u.int_in_range(3..=8)?;
-    for _ in 0..cmd_count {
-        let cmd: ExecCommandType = u.arbitrary()?;
-        ops.push(JsOperation::ExecCommand { command: cmd });
-        ops.push(JsOperation::GetOffsetWidth { target });
-    }
-
-    ops.push(JsOperation::ForceGC);
-    ops.push(JsOperation::GetBoundingClientRect { target });
-
-    Ok(ops)
-}
-
-/// CrossElementInteraction: element A style change invalidates element B layout.
-fn generate_cross_element_interaction(
-    u: &mut Unstructured,
-) -> arbitrary::Result<Vec<JsOperation>> {
-    let mut ops = Vec::new();
-
-    let elem_a: NodeRef = u.arbitrary()?;
-    let elem_b: NodeRef = u.arbitrary()?;
-    let elem_c: NodeRef = u.arbitrary()?;
-
-    // Set up parent-child relationship
-    ops.push(JsOperation::AppendChild {
-        parent: elem_a,
-        child: elem_b,
-    });
-
-    // Style A affects B's layout
-    ops.push(JsOperation::SetInlineStyle {
-        target: elem_a,
-        property: CssProperty::Display(DisplayValue::Flex),
-    });
-    ops.push(JsOperation::GetOffsetWidth { target: elem_b });
-
-    // Change A's style, read B's layout
-    ops.push(JsOperation::SetInlineStyle {
-        target: elem_a,
-        property: CssProperty::Display(DisplayValue::Grid),
-    });
-    ops.push(JsOperation::GetBoundingClientRect { target: elem_b });
-
-    // Reparent B under C
-    ops.push(JsOperation::AppendChild {
-        parent: elem_c,
-        child: elem_b,
-    });
-    ops.push(JsOperation::GetOffsetWidth { target: elem_b });
-
-    // Style change on C
-    ops.push(JsOperation::SetInlineStyle {
-        target: elem_c,
-        property: CssProperty::ContentVisibility(ContentVisibilityValue::Hidden),
-    });
-    ops.push(JsOperation::GetOffsetWidth { target: elem_b });
-
-    ops.push(JsOperation::ForceGC);
-
-    // QueueMicrotask for timing-sensitive mutations
-    ops.push(JsOperation::QueueMicrotask {
-        operations: vec![
-            JsOperation::SetInlineStyle {
-                target: elem_a,
-                property: CssProperty::Display(DisplayValue::None),
-            },
-            JsOperation::GetOffsetWidth { target: elem_b },
-        ],
-    });
-
-    Ok(ops)
+    Ok(rules)
 }

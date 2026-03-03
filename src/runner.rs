@@ -12,7 +12,7 @@ use tokio::sync::Semaphore;
 use oxiom_generator::FuzzProgram;
 use oxiom_serializer::serialize;
 
-use crate::cdp::{self, TestResult};
+use crate::cdp::{self, CrashType, TestResult};
 
 pub struct RunnerConfig {
     pub chrome_path: PathBuf,
@@ -28,7 +28,7 @@ pub struct RunnerConfig {
     pub buf_size: usize,
 }
 
-/// Phase 4: Crash deduplicator — hash ASAN stack traces to prevent duplicates.
+/// Crash deduplicator — hash ASAN stack traces to prevent duplicates.
 struct CrashDeduplicator {
     seen: HashSet<u64>,
 }
@@ -68,6 +68,9 @@ impl CrashDeduplicator {
                 || trimmed.contains("heap-buffer-overflow")
                 || trimmed.contains("SEGV on unknown address")
                 || trimmed.contains("double-free")
+                || trimmed.contains("use-after-poison")
+                || trimmed.contains("stack-buffer-overflow")
+                || trimmed.contains("alloc-dealloc-mismatch")
             {
                 for b in trimmed.bytes() {
                     hasher_val ^= b as u64;
@@ -86,6 +89,59 @@ impl CrashDeduplicator {
     }
 }
 
+/// Build crash metadata JSON for perfect reproducibility and analysis.
+fn build_crash_metadata(
+    iteration: u64,
+    crash_type: CrashType,
+    signal: Option<i32>,
+    exit_code: Option<i32>,
+    html_size: usize,
+    seed_info: &str,
+    asan_error_type: Option<&str>,
+) -> String {
+    let signal_str = match signal {
+        Some(s) => format!("{}", s),
+        None => "null".to_string(),
+    };
+    let exit_code_str = match exit_code {
+        Some(c) => format!("{}", c),
+        None => "null".to_string(),
+    };
+    let asan_type_str = match asan_error_type {
+        Some(t) => format!("\"{}\"", t),
+        None => "null".to_string(),
+    };
+
+    format!(
+        r#"{{
+  "iteration": {},
+  "crash_type": "{}",
+  "asan_error_type": {},
+  "signal": {},
+  "exit_code": {},
+  "html_size_bytes": {},
+  "seed_info": "{}",
+  "timestamp": "{}"
+}}"#,
+        iteration,
+        crash_type.as_str(),
+        asan_type_str,
+        signal_str,
+        exit_code_str,
+        html_size,
+        seed_info,
+        chrono_now(),
+    )
+}
+
+/// Simple timestamp without chrono dependency.
+fn chrono_now() -> String {
+    let dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("unix:{}", dur.as_secs())
+}
+
 pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.output_dir).await?;
     tokio::fs::create_dir_all(&config.crash_dir).await?;
@@ -93,13 +149,22 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     let timeout = Duration::from_millis(config.timeout_ms);
     let jobs = config.jobs;
 
+    // Determine actual seed for logging
+    let actual_seed = if config.seed != 0 {
+        config.seed
+    } else {
+        // Use entropy but log the seed for reproducibility
+        rand::random::<u64>()
+    };
+
     tracing::info!(
-        "Starting fuzzer: {} iterations, {}ms timeout, {} parallel jobs, {}ms virtual-time-budget, buf_size={}",
+        "Starting fuzzer: {} iterations, {}ms timeout, {} parallel jobs, {}ms vt-budget, buf={}B, seed={}",
         if config.continuous { "infinite".to_string() } else { config.iterations.to_string() },
         config.timeout_ms,
         jobs,
         config.virtual_time_budget,
         config.buf_size,
+        actual_seed,
     );
 
     let chrome_path = Arc::new(config.chrome_path.clone());
@@ -116,7 +181,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     let timeout_count = Arc::new(AtomicU64::new(0));
     let asan_found = Arc::new(AtomicBool::new(false));
 
-    // Phase 4: crash deduplicator
+    // Crash deduplicator
     let dedup = Arc::new(Mutex::new(CrashDeduplicator::new()));
 
     // Semaphore limits parallel Chrome processes
@@ -126,25 +191,23 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
 
     let mut handles = Vec::with_capacity(config.iterations.min(10000) as usize);
 
-    // Create RNG with optional seed
-    let mut rng: StdRng = if config.seed != 0 {
-        StdRng::seed_from_u64(config.seed)
-    } else {
-        StdRng::from_entropy()
-    };
+    let mut rng = StdRng::seed_from_u64(actual_seed);
 
     let mut i: u64 = 0;
     loop {
-        // Phase 4: in continuous mode, run forever; otherwise respect iterations
         if !config.continuous && i >= config.iterations {
             break;
         }
 
+        // Capture the RNG state for this iteration (for reproducibility)
+        let iter_seed = rng.next_u64();
+
         // Generate HTML synchronously (fast, CPU-bound)
         let html = {
-            let actual_buf_size = buf_size + (rng.next_u32() as usize % (buf_size / 2));
+            let mut iter_rng = StdRng::seed_from_u64(iter_seed);
+            let actual_buf_size = buf_size + (iter_rng.next_u32() as usize % (buf_size / 2));
             let mut buf = vec![0u8; actual_buf_size];
-            rng.fill_bytes(&mut buf);
+            iter_rng.fill_bytes(&mut buf);
 
             let mut u = Unstructured::new(&buf);
             match FuzzProgram::arbitrary(&mut u) {
@@ -163,6 +226,8 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
             }
         };
 
+        let html_len = html.len();
+
         // Write HTML to disk
         let filepath = output_dir.join(format!("test{}.html", i));
         let abs_path = std::fs::canonicalize(&*output_dir)
@@ -171,7 +236,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         tokio::fs::write(&filepath, &html).await?;
 
         if verbose {
-            tracing::debug!("[iter {}] generated {} bytes HTML", i, html.len());
+            tracing::debug!("[iter {}] generated {} bytes HTML (iter_seed={})", i, html_len, iter_seed);
         }
 
         // Clone Arcs for the async task
@@ -186,6 +251,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         let dedup = dedup.clone();
         let iterations = config.iterations;
         let continuous = config.continuous;
+        let seed_info = format!("master_seed={},iter_seed={}", actual_seed, iter_seed);
 
         let handle = tokio::spawn(async move {
             // Acquire semaphore slot — limits parallelism
@@ -197,20 +263,10 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                 TestResult::Ok => {
                     let _ = tokio::fs::remove_file(&filepath).await;
                 }
-                TestResult::Crash(log) => {
+                TestResult::Crash { log, crash_type, signal, exit_code } => {
                     let total_idx = crash_count.fetch_add(1, Ordering::Relaxed);
 
-                    // Check if this is an ASAN crash
-                    let is_asan = log.contains("AddressSanitizer")
-                        || log.contains("MemorySanitizer")
-                        || log.contains("UndefinedBehaviorSanitizer")
-                        || log.contains("ThreadSanitizer")
-                        || log.contains("LeakSanitizer")
-                        || log.contains("heap-use-after-free")
-                        || log.contains("heap-buffer-overflow")
-                        || log.contains("SEGV on unknown address");
-
-                    // Phase 4: deduplicate crashes
+                    // Deduplicate crashes
                     let is_unique = {
                         let mut d = dedup.lock().unwrap();
                         d.is_new(&log)
@@ -219,28 +275,46 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                     if is_unique {
                         let unique_idx = unique_crash_count.fetch_add(1, Ordering::Relaxed);
 
-                        // Save crash HTML with unique index
+                        // Extract ASAN error type for metadata
+                        let asan_error_type = cdp::extract_asan_error_type(&log);
+
+                        // Save crash HTML reproducer
                         let crash_html = crash_dir.join(format!("{}.html", unique_idx));
                         let _ = tokio::fs::copy(&filepath, &crash_html).await;
 
                         // Save ASAN/crash log
-                        let crash_log = crash_dir.join(format!("{}.log", unique_idx));
-                        let _ = tokio::fs::write(&crash_log, &log).await;
+                        let crash_log_path = crash_dir.join(format!("{}.log", unique_idx));
+                        let _ = tokio::fs::write(&crash_log_path, &log).await;
 
-                        if is_asan {
+                        // Save crash metadata JSON
+                        let metadata = build_crash_metadata(
+                            i,
+                            crash_type,
+                            signal,
+                            exit_code,
+                            html_len,
+                            &seed_info,
+                            asan_error_type,
+                        );
+                        let meta_path = crash_dir.join(format!("{}.json", unique_idx));
+                        let _ = tokio::fs::write(&meta_path, &metadata).await;
+
+                        if crash_type.is_sanitizer() {
+                            let error_desc = asan_error_type.unwrap_or(crash_type.as_str());
                             tracing::error!(
-                                "ASAN CRASH at iteration {}! Unique #{} (total crash #{}). Saved to {}.html / {}.log",
-                                i, unique_idx, total_idx, unique_idx, unique_idx,
+                                "🔴 {} CRASH #{} at iter {} (total #{}) — {} | saved: {}.html/.log/.json",
+                                crash_type.as_str(), unique_idx, i, total_idx,
+                                error_desc, unique_idx,
                             );
-                            for line in log.lines().take(20) {
+                            // Print first 25 lines of the crash log
+                            for line in log.lines().take(25) {
                                 tracing::error!("  {}", line);
                             }
                             asan_found.store(true, Ordering::Relaxed);
-                            // Phase 4: do NOT stop on first ASAN — continue fuzzing
                         } else {
                             tracing::warn!(
-                                "Unique crash #{} at iteration {} (saved as {}.html)",
-                                unique_idx, i, unique_idx
+                                "⚠ {} crash #{} at iter {} — saved: {}.html/.log/.json",
+                                crash_type.as_str(), unique_idx, i, unique_idx,
                             );
                         }
                     }
@@ -302,18 +376,19 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     let timeouts = timeout_count.load(Ordering::Relaxed);
 
     tracing::info!(
-        "Done: {} iterations in {:.1}s ({:.1} exec/s) | {} unique crashes ({} total) | {} timeouts",
+        "Done: {} iterations in {:.1}s ({:.1} exec/s) | {} unique crashes ({} total) | {} timeouts | seed={}",
         done,
         elapsed.as_secs_f64(),
         done as f64 / elapsed.as_secs_f64(),
         unique_crashes,
         crashes,
         timeouts,
+        actual_seed,
     );
 
     if asan_found.load(Ordering::Relaxed) {
         tracing::error!(
-            "ASAN crash(es) detected — {} unique reproducers saved in {}",
+            "ASAN crash(es) detected — {} unique reproducers in {}",
             unique_crashes,
             config.crash_dir.display()
         );
