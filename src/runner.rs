@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,16 +16,16 @@ use crate::cdp::{self, CrashType, TestResult};
 
 pub struct RunnerConfig {
     pub chrome_path: PathBuf,
-    pub iterations: u64,
+    pub iterations: u64,       // 0 = infinite
     pub timeout_ms: u64,
     pub output_dir: PathBuf,
     pub crash_dir: PathBuf,
     pub jobs: usize,
     pub verbose: bool,
-    pub continuous: bool,
     pub virtual_time_budget: u64,
     pub seed: u64,
     pub buf_size: usize,
+    pub shutdown: Arc<AtomicU8>, // 0=run, 1+=stop
 }
 
 /// Crash deduplicator — hash ASAN stack traces to prevent duplicates.
@@ -40,29 +40,24 @@ impl CrashDeduplicator {
         }
     }
 
-    /// Extract a hash from ASAN stack trace. Strip addresses, keep top 5 frame function names.
     fn hash_crash(&self, log: &str) -> u64 {
-        let mut hasher_val: u64 = 0xcbf29ce484222325; // FNV offset
+        let mut h: u64 = 0xcbf29ce484222325;
         let mut frame_count = 0;
 
         for line in log.lines() {
             let trimmed = line.trim();
-            // ASAN frames look like: #0 0xABCD in FunctionName file.cc:123
             if trimmed.starts_with('#') && frame_count < 5 {
-                // Extract function name: skip address, get the "in <name>" part
                 if let Some(in_pos) = trimmed.find(" in ") {
                     let after_in = &trimmed[in_pos + 4..];
                     let func_name = after_in.split_whitespace().next().unwrap_or(after_in);
-                    // FNV-1a hash
                     for b in func_name.bytes() {
-                        hasher_val ^= b as u64;
-                        hasher_val = hasher_val.wrapping_mul(0x100000001b3);
+                        h ^= b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
                     }
                     frame_count += 1;
                 }
             }
 
-            // Also hash the error type line (e.g., "heap-use-after-free")
             if trimmed.contains("ERROR: AddressSanitizer:")
                 || trimmed.contains("heap-use-after-free")
                 || trimmed.contains("heap-buffer-overflow")
@@ -73,23 +68,21 @@ impl CrashDeduplicator {
                 || trimmed.contains("alloc-dealloc-mismatch")
             {
                 for b in trimmed.bytes() {
-                    hasher_val ^= b as u64;
-                    hasher_val = hasher_val.wrapping_mul(0x100000001b3);
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
                 }
             }
         }
 
-        hasher_val
+        h
     }
 
-    /// Returns true if this is a new unique crash.
     fn is_new(&mut self, log: &str) -> bool {
         let hash = self.hash_crash(log);
         self.seen.insert(hash)
     }
 }
 
-/// Build crash metadata JSON for perfect reproducibility and analysis.
 fn build_crash_metadata(
     iteration: u64,
     crash_type: CrashType,
@@ -130,16 +123,27 @@ fn build_crash_metadata(
         exit_code_str,
         html_size,
         seed_info,
-        chrono_now(),
+        unix_timestamp(),
     )
 }
 
-/// Simple timestamp without chrono dependency.
-fn chrono_now() -> String {
+fn unix_timestamp() -> String {
     let dur = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     format!("unix:{}", dur.as_secs())
+}
+
+/// Format duration as human-readable (e.g., "2h 15m 30s").
+fn format_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m {}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {}m {}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+    }
 }
 
 pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
@@ -148,24 +152,30 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
 
     let timeout = Duration::from_millis(config.timeout_ms);
     let jobs = config.jobs;
+    let infinite = config.iterations == 0;
 
-    // Determine actual seed for logging
+    // Determine actual seed
     let actual_seed = if config.seed != 0 {
         config.seed
     } else {
-        // Use entropy but log the seed for reproducibility
         rand::random::<u64>()
     };
 
+    tracing::info!("=== oxiom fuzzer ===");
     tracing::info!(
-        "Starting fuzzer: {} iterations, {}ms timeout, {} parallel jobs, {}ms vt-budget, buf={}B, seed={}",
-        if config.continuous { "infinite".to_string() } else { config.iterations.to_string() },
-        config.timeout_ms,
+        "mode: {} | jobs: {} | timeout: {}ms | vt-budget: {}ms | buf: {}B | seed: {}",
+        if infinite { "INFINITE".to_string() } else { format!("{} iterations", config.iterations) },
         jobs,
+        config.timeout_ms,
         config.virtual_time_budget,
         config.buf_size,
         actual_seed,
     );
+    tracing::info!("chrome: {}", config.chrome_path.display());
+    tracing::info!("crashes: {}", config.crash_dir.display());
+    if infinite {
+        tracing::info!("Press Ctrl+C to stop gracefully, Ctrl+C again to force exit.");
+    }
 
     let chrome_path = Arc::new(config.chrome_path.clone());
     let output_dir = Arc::new(config.output_dir.clone());
@@ -173,36 +183,41 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     let verbose = config.verbose;
     let virtual_time_budget = config.virtual_time_budget;
     let buf_size = config.buf_size;
+    let shutdown = config.shutdown.clone();
 
     // Shared counters
+    let total_generated = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
     let crash_count = Arc::new(AtomicU64::new(0));
     let unique_crash_count = Arc::new(AtomicU64::new(0));
     let timeout_count = Arc::new(AtomicU64::new(0));
     let asan_found = Arc::new(AtomicBool::new(false));
 
-    // Crash deduplicator
     let dedup = Arc::new(Mutex::new(CrashDeduplicator::new()));
-
-    // Semaphore limits parallel Chrome processes
     let sem = Arc::new(Semaphore::new(jobs));
 
     let start = Instant::now();
 
-    let mut handles = Vec::with_capacity(config.iterations.min(10000) as usize);
-
+    let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(4096);
     let mut rng = StdRng::seed_from_u64(actual_seed);
+    let mut last_stats = Instant::now();
 
     let mut i: u64 = 0;
     loop {
-        if !config.continuous && i >= config.iterations {
+        // Check shutdown signal
+        if shutdown.load(Ordering::Relaxed) > 0 {
+            tracing::info!("Shutdown signal received — stopping generation, waiting for {} in-flight tasks...", handles.len());
             break;
         }
 
-        // Capture the RNG state for this iteration (for reproducibility)
+        // Check iteration limit (if not infinite)
+        if !infinite && i >= config.iterations {
+            break;
+        }
+
         let iter_seed = rng.next_u64();
 
-        // Generate HTML synchronously (fast, CPU-bound)
+        // Generate HTML
         let html = {
             let mut iter_rng = StdRng::seed_from_u64(iter_seed);
             let actual_buf_size = buf_size + (iter_rng.next_u32() as usize % (buf_size / 2));
@@ -227,19 +242,24 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         };
 
         let html_len = html.len();
+        total_generated.fetch_add(1, Ordering::Relaxed);
 
         // Write HTML to disk
         let filepath = output_dir.join(format!("test{}.html", i));
         let abs_path = std::fs::canonicalize(&*output_dir)
             .unwrap_or_else(|_| output_dir.to_path_buf())
             .join(format!("test{}.html", i));
-        tokio::fs::write(&filepath, &html).await?;
-
-        if verbose {
-            tracing::debug!("[iter {}] generated {} bytes HTML (iter_seed={})", i, html_len, iter_seed);
+        if let Err(e) = tokio::fs::write(&filepath, &html).await {
+            tracing::warn!("Failed to write test file: {}", e);
+            i += 1;
+            continue;
         }
 
-        // Clone Arcs for the async task
+        if verbose {
+            tracing::debug!("[iter {}] {} bytes (iter_seed={})", i, html_len, iter_seed);
+        }
+
+        // Clone for async task
         let sem = sem.clone();
         let chrome_path = chrome_path.clone();
         let crash_dir = crash_dir.clone();
@@ -249,12 +269,9 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         let timeout_count = timeout_count.clone();
         let asan_found = asan_found.clone();
         let dedup = dedup.clone();
-        let iterations = config.iterations;
-        let continuous = config.continuous;
-        let seed_info = format!("master_seed={},iter_seed={}", actual_seed, iter_seed);
+        let seed_info = format!("master={},iter={}", actual_seed, iter_seed);
 
         let handle = tokio::spawn(async move {
-            // Acquire semaphore slot — limits parallelism
             let _permit = sem.acquire().await.unwrap();
 
             let result = cdp::run_testcase(&chrome_path, &abs_path, timeout, virtual_time_budget).await;
@@ -264,9 +281,8 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                     let _ = tokio::fs::remove_file(&filepath).await;
                 }
                 TestResult::Crash { log, crash_type, signal, exit_code } => {
-                    let total_idx = crash_count.fetch_add(1, Ordering::Relaxed);
+                    crash_count.fetch_add(1, Ordering::Relaxed);
 
-                    // Deduplicate crashes
                     let is_unique = {
                         let mut d = dedup.lock().unwrap();
                         d.is_new(&log)
@@ -275,45 +291,35 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                     if is_unique {
                         let unique_idx = unique_crash_count.fetch_add(1, Ordering::Relaxed);
 
-                        // Extract ASAN error type for metadata
                         let asan_error_type = cdp::extract_asan_error_type(&log);
 
-                        // Save crash HTML reproducer
-                        let crash_html = crash_dir.join(format!("{}.html", unique_idx));
+                        // Save all crash artifacts
+                        let crash_html = crash_dir.join(format!("crash-{}.html", unique_idx));
                         let _ = tokio::fs::copy(&filepath, &crash_html).await;
 
-                        // Save ASAN/crash log
-                        let crash_log_path = crash_dir.join(format!("{}.log", unique_idx));
+                        let crash_log_path = crash_dir.join(format!("crash-{}.log", unique_idx));
                         let _ = tokio::fs::write(&crash_log_path, &log).await;
 
-                        // Save crash metadata JSON
                         let metadata = build_crash_metadata(
-                            i,
-                            crash_type,
-                            signal,
-                            exit_code,
-                            html_len,
-                            &seed_info,
-                            asan_error_type,
+                            i, crash_type, signal, exit_code,
+                            html_len, &seed_info, asan_error_type,
                         );
-                        let meta_path = crash_dir.join(format!("{}.json", unique_idx));
+                        let meta_path = crash_dir.join(format!("crash-{}.json", unique_idx));
                         let _ = tokio::fs::write(&meta_path, &metadata).await;
 
                         if crash_type.is_sanitizer() {
                             let error_desc = asan_error_type.unwrap_or(crash_type.as_str());
                             tracing::error!(
-                                "🔴 {} CRASH #{} at iter {} (total #{}) — {} | saved: {}.html/.log/.json",
-                                crash_type.as_str(), unique_idx, i, total_idx,
-                                error_desc, unique_idx,
+                                "!!! {} #{} at iter {} — {} — saved crash-{}.html",
+                                crash_type.as_str(), unique_idx, i, error_desc, unique_idx,
                             );
-                            // Print first 25 lines of the crash log
-                            for line in log.lines().take(25) {
+                            for line in log.lines().take(20) {
                                 tracing::error!("  {}", line);
                             }
                             asan_found.store(true, Ordering::Relaxed);
                         } else {
                             tracing::warn!(
-                                "⚠ {} crash #{} at iter {} — saved: {}.html/.log/.json",
+                                "{} crash #{} at iter {} — saved crash-{}.html",
                                 crash_type.as_str(), unique_idx, i, unique_idx,
                             );
                         }
@@ -327,30 +333,33 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                 }
             }
 
-            let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-
-            // Progress every 100 iterations (or every iter if verbose)
-            let interval = if verbose { 1 } else { 100 };
-            if done % interval == 0 || (!continuous && done == iterations) {
-                let elapsed = start.elapsed().as_secs_f64();
-                let rate = done as f64 / elapsed;
-                tracing::info!(
-                    "[{}/{}] {:.1} exec/s | {} unique crashes ({} total) | {} timeouts",
-                    done,
-                    if continuous { "inf".to_string() } else { iterations.to_string() },
-                    rate,
-                    unique_crash_count.load(Ordering::Relaxed),
-                    crash_count.load(Ordering::Relaxed),
-                    timeout_count.load(Ordering::Relaxed),
-                );
-            }
+            completed.fetch_add(1, Ordering::Relaxed);
         });
 
         handles.push(handle);
 
-        // Periodically drain completed handles to avoid unbounded growth in continuous mode
-        if handles.len() > 10000 {
-            let mut remaining = Vec::new();
+        // Live stats every 5 seconds
+        if last_stats.elapsed() >= Duration::from_secs(5) {
+            let done = completed.load(Ordering::Relaxed);
+            let elapsed = start.elapsed();
+            let rate = done as f64 / elapsed.as_secs_f64().max(0.001);
+            let uniq = unique_crash_count.load(Ordering::Relaxed);
+            let total_c = crash_count.load(Ordering::Relaxed);
+            let to = timeout_count.load(Ordering::Relaxed);
+            let gen = total_generated.load(Ordering::Relaxed);
+            let inflight = gen.saturating_sub(done);
+
+            tracing::info!(
+                "[{}] exec: {} | {:.1}/s | crashes: {} unique ({} total) | timeouts: {} | in-flight: {}",
+                format_duration(elapsed),
+                done, rate, uniq, total_c, to, inflight,
+            );
+            last_stats = Instant::now();
+        }
+
+        // Drain completed handles periodically to avoid unbounded growth
+        if handles.len() > 8192 {
+            let mut remaining = Vec::with_capacity(4096);
             for h in handles.drain(..) {
                 if h.is_finished() {
                     let _ = h.await;
@@ -364,31 +373,47 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         i += 1;
     }
 
-    // Wait for all in-flight tasks
-    for h in handles {
-        let _ = h.await;
+    // Wait for all in-flight tasks (graceful shutdown)
+    let inflight = handles.len();
+    if inflight > 0 {
+        tracing::info!("Waiting for {} in-flight tasks to complete...", inflight);
+        let mut done_count = 0;
+        for h in handles {
+            // Check for force exit while waiting
+            if shutdown.load(Ordering::Relaxed) > 1 {
+                tracing::warn!("Force exit — aborting remaining tasks");
+                break;
+            }
+            let _ = h.await;
+            done_count += 1;
+            if done_count % 100 == 0 {
+                tracing::info!("  ... {}/{} tasks completed", done_count, inflight);
+            }
+        }
     }
 
+    // Final stats
     let elapsed = start.elapsed();
     let done = completed.load(Ordering::Relaxed);
-    let crashes = crash_count.load(Ordering::Relaxed);
     let unique_crashes = unique_crash_count.load(Ordering::Relaxed);
+    let crashes = crash_count.load(Ordering::Relaxed);
     let timeouts = timeout_count.load(Ordering::Relaxed);
 
+    tracing::info!("=== oxiom — final stats ===");
     tracing::info!(
-        "Done: {} iterations in {:.1}s ({:.1} exec/s) | {} unique crashes ({} total) | {} timeouts | seed={}",
+        "runtime: {} | executions: {} ({:.1}/s)",
+        format_duration(elapsed),
         done,
-        elapsed.as_secs_f64(),
-        done as f64 / elapsed.as_secs_f64(),
-        unique_crashes,
-        crashes,
-        timeouts,
-        actual_seed,
+        done as f64 / elapsed.as_secs_f64().max(0.001),
+    );
+    tracing::info!(
+        "crashes: {} unique, {} total | timeouts: {} | seed: {}",
+        unique_crashes, crashes, timeouts, actual_seed,
     );
 
     if asan_found.load(Ordering::Relaxed) {
         tracing::error!(
-            "ASAN crash(es) detected — {} unique reproducers in {}",
+            "SANITIZER CRASHES FOUND — {} unique reproducers in {}",
             unique_crashes,
             config.crash_dir.display()
         );
