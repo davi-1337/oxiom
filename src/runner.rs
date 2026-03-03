@@ -337,8 +337,8 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
 
         handles.push(handle);
 
-        // Live stats every 5 seconds
-        if last_stats.elapsed() >= Duration::from_secs(5) {
+        // Live stats every 3 seconds
+        if last_stats.elapsed() >= Duration::from_secs(3) {
             let done = completed.load(Ordering::Relaxed);
             let elapsed = start.elapsed();
             let rate = done as f64 / elapsed.as_secs_f64().max(0.001);

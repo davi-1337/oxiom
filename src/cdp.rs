@@ -312,18 +312,41 @@ pub async fn run_testcase(
             }
 
             if !status.success() {
+                // Chrome-specific exit codes
                 let code = status.code().unwrap_or(-1);
-                // Non-zero exit with substantial stderr indicates renderer crash
-                if code != 0 && !stderr.is_empty() && stderr.len() > 50 {
-                    return TestResult::Crash {
-                        log: format!(
-                            "Chrome exited with code {}\n\nSTDERR:\n{}",
-                            code, stderr
-                        ),
-                        crash_type: CrashType::ExitCode,
+                match code {
+                    133 => return TestResult::Crash {
+                        log: format!("Chrome renderer crash (exit 133)\n\nSTDERR:\n{}", stderr),
+                        crash_type: CrashType::RendererKill,
                         signal: None,
-                        exit_code: Some(code),
-                    };
+                        exit_code: Some(133),
+                    },
+                    139 => return TestResult::Crash {
+                        log: format!("Chrome SIGSEGV (exit 139)\n\nSTDERR:\n{}", stderr),
+                        crash_type: CrashType::Signal,
+                        signal: Some(11),
+                        exit_code: Some(139),
+                    },
+                    134 => return TestResult::Crash {
+                        log: format!("Chrome SIGABRT (exit 134)\n\nSTDERR:\n{}", stderr),
+                        crash_type: CrashType::Signal,
+                        signal: Some(6),
+                        exit_code: Some(134),
+                    },
+                    _ => {
+                        // Non-zero exit with substantial stderr indicates renderer crash
+                        if code != 0 && !stderr.is_empty() && stderr.len() > 50 {
+                            return TestResult::Crash {
+                                log: format!(
+                                    "Chrome exited with code {}\n\nSTDERR:\n{}",
+                                    code, stderr
+                                ),
+                                crash_type: CrashType::ExitCode,
+                                signal: None,
+                                exit_code: Some(code),
+                            };
+                        }
+                    }
                 }
             }
 

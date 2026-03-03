@@ -293,6 +293,77 @@ pub enum JsOperation {
         target: NodeRef,
         html: InnerHtmlContent,
     },
+
+    // ========================================
+    // Blink-killer operations
+    // ========================================
+
+    /// Set selection range across nodes.
+    SetSelectionRange {
+        anchor_node: NodeRef,
+        anchor_offset: u8,
+        focus_node: NodeRef,
+        focus_offset: u8,
+    },
+
+    /// element.animate() — Web Animations API.
+    WebAnimate {
+        target: NodeRef,
+        duration_ms: u16,
+    },
+
+    /// Cancel running animations on a node.
+    CancelAnimations {
+        target: NodeRef,
+    },
+
+    /// Get animations on a node (force animation state query).
+    GetAnimations {
+        target: NodeRef,
+    },
+
+    /// Change container-type dynamically.
+    SetContainerType {
+        target: NodeRef,
+        container_type: ContainerTypeValue,
+    },
+
+    /// classList batch manipulation.
+    ClassListBatch {
+        target: NodeRef,
+        ops: Vec<ClassListOp>,
+    },
+
+    /// Change slot attribute (triggers slot redistribution).
+    SetSlotAttribute {
+        target: NodeRef,
+        slot_name: String8,
+    },
+
+    /// Toggle <details> open/closed.
+    ToggleDetailsOpen {
+        target: NodeRef,
+    },
+
+    /// Show a <dialog> element.
+    ShowDialog {
+        target: NodeRef,
+        modal: bool,
+    },
+
+    /// Close a <dialog> element.
+    CloseDialog {
+        target: NodeRef,
+    },
+
+    /// getComputedStyle on a pseudo-element.
+    GetPseudoComputedStyle {
+        target: NodeRef,
+        pseudo: PseudoType,
+    },
+
+    /// Force print layout (different code path in Blink).
+    PrintLayout,
 }
 
 /// Tags for dynamically created elements.
