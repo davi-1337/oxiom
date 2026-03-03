@@ -51,14 +51,19 @@ fn generate_mega_script(
     font_faces: &[FontFaceDecl],
 ) -> arbitrary::Result<Vec<JsOperation>> {
     // Choose between different mega-strategies
-    let strategy: u8 = u.int_in_range(0..=4)?;
+    let strategy: u8 = u.int_in_range(0..=9)?;
 
     let mut all_ops = match strategy {
         0 => generate_phased_attack(u, font_faces)?,
         1 => generate_timing_maze(u)?,
         2 => generate_chaos_storm(u)?,
         3 => generate_lifecycle_abuse(u, font_faces)?,
-        _ => generate_observer_cascade(u)?,
+        4 => generate_observer_cascade(u)?,
+        5 => generate_display_switching_storm(u)?,
+        6 => generate_slot_redistribution(u)?,
+        7 => generate_column_fragmentation(u)?,
+        8 => generate_container_query_cycle(u)?,
+        _ => generate_focus_navigation_attack(u)?,
     };
 
     // Always append a final GC + stale ref access burst
