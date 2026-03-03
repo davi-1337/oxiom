@@ -146,6 +146,91 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
+struct Corpus {
+    entries: Vec<CorpusEntry>,
+    max_size: usize,
+}
+
+struct CorpusEntry {
+    bytes: Vec<u8>,
+    priority: u8, // 0=normal, 1=large_output, 2=near_crash
+}
+
+impl Corpus {
+    fn new(max_size: usize) -> Self {
+        Self { entries: Vec::new(), max_size }
+    }
+
+    fn add(&mut self, bytes: Vec<u8>, priority: u8) {
+        if self.entries.len() >= self.max_size {
+            // Remove lowest priority entry
+            if let Some(min_idx) = self.entries.iter().position(|e| e.priority == 0) {
+                self.entries.swap_remove(min_idx);
+            } else {
+                return;
+            }
+        }
+        self.entries.push(CorpusEntry { bytes, priority });
+    }
+
+    fn pick(&self, rng: &mut impl RngCore) -> Option<&[u8]> {
+        if self.entries.is_empty() { return None; }
+        // Weight higher priority entries
+        let total_weight: u32 = self.entries.iter().map(|e| (e.priority as u32 + 1) * 2).sum();
+        let mut target = rng.next_u32() % total_weight;
+        for entry in &self.entries {
+            let w = (entry.priority as u32 + 1) * 2;
+            if target < w {
+                return Some(&entry.bytes);
+            }
+            target -= w;
+        }
+        Some(&self.entries[0].bytes)
+    }
+
+    fn mutate(bytes: &[u8], rng: &mut impl RngCore) -> Vec<u8> {
+        let mut result = bytes.to_vec();
+        if result.is_empty() { return result; }
+        let mutations = 1 + (rng.next_u32() % 5) as usize;
+        for _ in 0..mutations {
+            match rng.next_u32() % 5 {
+                0 => { // flip random bit
+                    let idx = rng.next_u32() as usize % result.len();
+                    let bit = 1u8 << (rng.next_u32() % 8);
+                    result[idx] ^= bit;
+                }
+                1 => { // insert random byte
+                    let idx = rng.next_u32() as usize % (result.len() + 1);
+                    result.insert(idx, rng.next_u32() as u8);
+                }
+                2 if result.len() > 10 => { // remove random byte
+                    let idx = rng.next_u32() as usize % result.len();
+                    result.remove(idx);
+                }
+                3 => { // replace chunk
+                    let idx = rng.next_u32() as usize % result.len();
+                    let len = (1 + rng.next_u32() as usize % 4).min(result.len() - idx);
+                    for j in 0..len {
+                        result[idx + j] = rng.next_u32() as u8;
+                    }
+                }
+                _ => { // duplicate a section
+                    if result.len() < 16000 {
+                        let idx = rng.next_u32() as usize % result.len();
+                        let len = (1 + rng.next_u32() as usize % 16).min(result.len() - idx);
+                        let chunk: Vec<u8> = result[idx..idx+len].to_vec();
+                        let insert_at = rng.next_u32() as usize % (result.len() + 1);
+                        for (j, b) in chunk.into_iter().enumerate() {
+                            result.insert(insert_at + j, b);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
 pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&config.output_dir).await?;
     tokio::fs::create_dir_all(&config.crash_dir).await?;
@@ -200,6 +285,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
 
     let mut handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(4096);
     let mut rng = StdRng::seed_from_u64(actual_seed);
+    let corpus = Arc::new(Mutex::new(Corpus::new(1000)));
     let mut last_stats = Instant::now();
 
     let mut i: u64 = 0;
@@ -218,22 +304,42 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         let iter_seed = rng.next_u64();
 
         // Generate HTML
-        let html = {
+        let (html, raw_bytes) = {
             let mut iter_rng = StdRng::seed_from_u64(iter_seed);
-            let actual_buf_size = buf_size + (iter_rng.next_u32() as usize % (buf_size / 2));
-            let mut buf = vec![0u8; actual_buf_size];
-            iter_rng.fill_bytes(&mut buf);
 
+            // 30% corpus mutation, 70% fresh random
+            let buf = {
+                let use_corpus = iter_rng.next_u32() % 10 < 3;
+                if use_corpus {
+                    let corpus_lock = corpus.lock().unwrap();
+                    if let Some(base) = corpus_lock.pick(&mut iter_rng) {
+                        Corpus::mutate(base, &mut iter_rng)
+                    } else {
+                        drop(corpus_lock);
+                        let actual_buf_size = buf_size + (iter_rng.next_u32() as usize % (buf_size / 2));
+                        let mut b = vec![0u8; actual_buf_size];
+                        iter_rng.fill_bytes(&mut b);
+                        b
+                    }
+                } else {
+                    let actual_buf_size = buf_size + (iter_rng.next_u32() as usize % (buf_size / 2));
+                    let mut b = vec![0u8; actual_buf_size];
+                    iter_rng.fill_bytes(&mut b);
+                    b
+                }
+            };
+
+            let raw = buf.clone();
             let mut u = Unstructured::new(&buf);
             match FuzzProgram::arbitrary(&mut u) {
-                Ok(program) => serialize(
+                Ok(program) => (serialize(
                     &program.font_faces,
                     &program.css_rules,
                     &program.dom,
                     &program.script,
                     &program.keyframes,
                     &program.at_rules,
-                ),
+                ), raw),
                 Err(_) => {
                     i += 1;
                     continue;
@@ -259,6 +365,12 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
             tracing::debug!("[iter {}] {} bytes (iter_seed={})", i, html_len, iter_seed);
         }
 
+        // Add to corpus if HTML is substantial
+        if html_len > 5000 {
+            let mut c = corpus.lock().unwrap();
+            c.add(raw_bytes.clone(), 1);
+        }
+
         // Clone for async task (prefixed t_ to not shadow outer Arcs)
         let t_sem = sem.clone();
         let t_chrome = chrome_path.clone();
@@ -269,6 +381,8 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
         let t_timeout_count = timeout_count.clone();
         let t_asan_found = asan_found.clone();
         let t_dedup = dedup.clone();
+        let t_corpus = corpus.clone();
+        let t_raw_bytes = raw_bytes;
         let seed_info = format!("master={},iter={}", actual_seed, iter_seed);
 
         let handle = tokio::spawn(async move {
@@ -290,6 +404,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
 
                     if is_unique {
                         let unique_idx = t_unique_crash.fetch_add(1, Ordering::Relaxed);
+                        { let mut c = t_corpus.lock().unwrap(); c.add(t_raw_bytes.clone(), 2); }
 
                         let asan_error_type = cdp::extract_asan_error_type(&log);
 

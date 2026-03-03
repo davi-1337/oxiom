@@ -407,6 +407,54 @@ impl CreateElementTag {
 }
 
 #[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum ContainerTypeValue {
+    Normal,
+    InlineSize,
+    Size,
+}
+
+impl ContainerTypeValue {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::InlineSize => "inline-size",
+            Self::Size => "size",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Arbitrary)]
+pub enum ClassListOp {
+    Add(String8),
+    Remove(String8),
+    Toggle(String8),
+    Replace(String8, String8),
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum PseudoType {
+    Before,
+    After,
+    Marker,
+    FirstLine,
+    FirstLetter,
+    Backdrop,
+}
+
+impl PseudoType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Before => "::before",
+            Self::After => "::after",
+            Self::Marker => "::marker",
+            Self::FirstLine => "::first-line",
+            Self::FirstLetter => "::first-letter",
+            Self::Backdrop => "::backdrop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
 pub enum ShadowRootMode {
     Open,
     Closed,
@@ -567,6 +615,21 @@ impl<'a> Arbitrary<'a> for InnerHtmlContent {
             "",
             "<svg><rect/></svg>",
             "<details><summary>s</summary></details>",
+            // Dangerous templates that trigger complex code paths
+            "<div style='display:grid;grid-template-columns:subgrid'><span>a</span></div>",
+            "<div style='columns:3;column-fill:auto'><p>col1</p><p style='break-before:column'>col2</p></div>",
+            "<div style='container-type:inline-size'><div style='width:100cqi'>cq</div></div>",
+            "<table><colgroup><col span='1000'></colgroup><tr><td>x</td></tr></table>",
+            "<div contenteditable='true'><b><i><u>nested editing</u></i></b></div>",
+            "<div style='display:contents'><div style='display:grid'><slot></slot></div></div>",
+            "<math><mrow><mi>x</mi><mo>=</mo><mn>0</mn></mrow></math>",
+            "<dialog open style='display:grid'><form method='dialog'><button>x</button></form></dialog>",
+            "<div style='position:sticky;top:0;contain:strict'><div style='height:9999px'>tall</div></div>",
+            "<div style='overflow:auto;scroll-snap-type:y mandatory'><div style='scroll-snap-align:start;height:100vh'>snap</div></div>",
+            "<ruby>漢<rp>(</rp><rt>kan</rt><rp>)</rp></ruby>",
+            "<div style='writing-mode:vertical-rl;direction:rtl'><span style='display:inline-block'>v</span></div>",
+            "<fieldset style='display:grid'><legend style='float:left'>leg</legend><input></fieldset>",
+            "<div style='aspect-ratio:1/0;width:100px;display:grid'>ratio</div>",
         ];
         let idx: usize = u.arbitrary()?;
         Ok(InnerHtmlContent(contents[idx % contents.len()].to_string()))

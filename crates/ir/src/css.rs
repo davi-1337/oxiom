@@ -251,6 +251,24 @@ pub enum CssProperty {
     Outline(OutlineValue),
     /// Phase 6: global keyword reset on any property.
     GlobalReset(CssPropertyName, GlobalKeyword),
+    // Container queries (very buggy in Blink)
+    ContainerType(ContainerTypeValue),
+    ContainerName(String8),
+    // Subgrid (recently implemented, full of bugs)
+    GridTemplateColumnsSubgrid,
+    GridTemplateRowsSubgrid,
+    // Scroll snap (interacts with layout in complex ways)
+    ScrollSnapType(ScrollSnapTypeValue),
+    ScrollSnapAlign(ScrollSnapAlignValue),
+    // aspect-ratio (interacts with grid/flex sizing)
+    AspectRatio(AspectRatioValue),
+    // text-wrap: balance/pretty (new, different line breaking)
+    TextWrap(TextWrapValue),
+    // Logical properties (interact with writing-mode dangerously)
+    InlineSize(LengthOrAuto),
+    BlockSize(LengthOrAuto),
+    MarginInline(LengthOrAuto),
+    PaddingBlock(LengthValue),
 }
 
 // -- Value types --
