@@ -39,6 +39,12 @@ pub enum CrashType {
     ExitCode,
     /// Chrome process error
     ProcessError,
+    /// Chromium CHECK/DCHECK failure
+    CheckFailure,
+    /// Renderer/GPU process crash
+    RendererKill,
+    /// Out of memory
+    Oom,
 }
 
 impl CrashType {
@@ -52,16 +58,41 @@ impl CrashType {
             Self::Signal => "SIGNAL",
             Self::ExitCode => "EXIT_CODE",
             Self::ProcessError => "PROCESS_ERROR",
+            Self::CheckFailure => "CHECK_FAILURE",
+            Self::RendererKill => "RENDERER_KILL",
+            Self::Oom => "OOM",
         }
     }
 
     pub fn is_sanitizer(&self) -> bool {
         matches!(self, Self::Asan | Self::Msan | Self::Ubsan | Self::Tsan | Self::Lsan)
     }
+
+    pub fn is_high_value(&self) -> bool {
+        matches!(self, Self::Asan | Self::Msan | Self::Ubsan | Self::CheckFailure | Self::Signal)
+    }
 }
 
 /// ASAN/sanitizer signature patterns in stderr.
 const SANITIZER_PATTERNS: &[(&str, CrashType)] = &[
+    // CHECK/DCHECK failures (Chromium-specific, real bugs)
+    ("Check failed:", CrashType::CheckFailure),
+    ("DCHECK failed:", CrashType::CheckFailure),
+    ("Fatal error in", CrashType::CheckFailure),  // V8 fatal
+    ("[FATAL:", CrashType::CheckFailure),          // Chromium logging
+    ("#CRASHED", CrashType::CheckFailure),          // test harness marker
+    ("Received signal", CrashType::CheckFailure),   // Chromium signal handler
+
+    // Renderer/GPU process crashes
+    ("Renderer process exited", CrashType::RendererKill),
+    ("GPU process exited", CrashType::RendererKill),
+    ("Renderer process crashed", CrashType::RendererKill),
+    ("renderer killed", CrashType::RendererKill),
+
+    // OOM
+    ("Out of memory", CrashType::Oom),
+    ("Allocation failed", CrashType::Oom),
+
     // AddressSanitizer patterns (most common)
     ("ERROR: AddressSanitizer:", CrashType::Asan),
     ("AddressSanitizer: heap-use-after-free", CrashType::Asan),
