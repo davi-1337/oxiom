@@ -216,3 +216,33 @@ pub fn boundary_global_keywords() -> Vec<GlobalKeyword> {
         GlobalKeyword::Revert,
     ]
 }
+
+pub fn boundary_aspect_ratios() -> Vec<AspectRatioValue> {
+    vec![
+        AspectRatioValue::Auto,
+        AspectRatioValue::Ratio(0, 1),     // zero aspect ratio
+        AspectRatioValue::Ratio(1, 0),     // infinite aspect ratio
+        AspectRatioValue::Ratio(1, 1),
+        AspectRatioValue::Ratio(16, 9),
+        AspectRatioValue::Ratio(u16::MAX, 1),
+        AspectRatioValue::Ratio(1, u16::MAX),
+    ]
+}
+
+pub fn boundary_scroll_snap_types() -> Vec<ScrollSnapTypeValue> {
+    vec![
+        ScrollSnapTypeValue::None,
+        ScrollSnapTypeValue::XMandatory,
+        ScrollSnapTypeValue::YMandatory,
+        ScrollSnapTypeValue::BothMandatory,
+        ScrollSnapTypeValue::BlockMandatory,
+    ]
+}
+
+pub fn boundary_container_types() -> Vec<ContainerTypeValue> {
+    vec![
+        ContainerTypeValue::Normal,
+        ContainerTypeValue::InlineSize,
+        ContainerTypeValue::Size,
+    ]
+}

@@ -56,6 +56,16 @@ pub enum HtmlElement {
     Rt,
     Video,
     Img,
+    // Blink-killer elements
+    Marquee,
+    Br,
+    Wbr,
+    Col,
+    Colgroup,
+    Caption,
+    Progress,
+    Meter,
+    Output,
 }
 
 impl HtmlElement {
@@ -109,11 +119,20 @@ impl HtmlElement {
             Self::Rt => "rt",
             Self::Video => "video",
             Self::Img => "img",
+            Self::Marquee => "marquee",
+            Self::Br => "br",
+            Self::Wbr => "wbr",
+            Self::Col => "col",
+            Self::Colgroup => "colgroup",
+            Self::Caption => "caption",
+            Self::Progress => "progress",
+            Self::Meter => "meter",
+            Self::Output => "output",
         }
     }
 
     pub fn is_void(&self) -> bool {
-        matches!(self, Self::Input | Self::Img)
+        matches!(self, Self::Input | Self::Img | Self::Br | Self::Wbr | Self::Col)
     }
 }
 
