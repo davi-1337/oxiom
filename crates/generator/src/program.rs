@@ -561,6 +561,298 @@ fn generate_observer_cascade(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOp
     Ok(ops)
 }
 
+/// Display switching storm: rapidly switch display between layout-creating values
+/// (grid/flex/table) and destructive values (none/contents), forcing layout between
+/// each switch. This is the #1 UAF pattern for Blink layout bugs (~40% of layout crashes).
+fn generate_display_switching_storm(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::new();
+    let display_values = [
+        DisplayValue::Grid,
+        DisplayValue::Flex,
+        DisplayValue::Table,
+        DisplayValue::InlineGrid,
+        DisplayValue::InlineFlex,
+        DisplayValue::Block,
+    ];
+    let destructive_values = [DisplayValue::None, DisplayValue::Contents, DisplayValue::Inline];
+    let rounds = u.int_in_range(5..=15)?;
+
+    for _ in 0..rounds {
+        let node = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        // Set initial display (layout-creating)
+        let initial_idx: usize = u.arbitrary()?;
+        let initial_display = display_values[initial_idx % display_values.len()];
+        ops.push(JsOperation::SetInlineStyle {
+            target: node,
+            property: CssProperty::Display(initial_display),
+        });
+        // Force layout
+        ops.push(JsOperation::GetOffsetWidth { target: node });
+
+        // Switch to destructive display
+        let destructive_idx: usize = u.arbitrary()?;
+        let dest_display = destructive_values[destructive_idx % destructive_values.len()];
+        ops.push(JsOperation::SetInlineStyle {
+            target: node,
+            property: CssProperty::Display(dest_display),
+        });
+        // Force layout on stale LayoutObject
+        ops.push(JsOperation::GetOffsetWidth { target: node });
+        ops.push(JsOperation::GetBoundingClientRect { target: node });
+
+        // Add content-visibility switching
+        if u.arbitrary::<bool>()? {
+            ops.push(JsOperation::SetInlineStyle {
+                target: node,
+                property: CssProperty::ContentVisibility(ContentVisibilityValue::Hidden),
+            });
+            ops.push(JsOperation::GetOffsetHeight { target: node });
+            ops.push(JsOperation::SetInlineStyle {
+                target: node,
+                property: CssProperty::ContentVisibility(ContentVisibilityValue::Auto),
+            });
+        }
+
+        // GC to free stale objects
+        if u.arbitrary::<bool>()? {
+            ops.push(JsOperation::ForceGC);
+        }
+
+        // Switch back to creating display (access freed memory)
+        ops.push(JsOperation::SetInlineStyle {
+            target: node,
+            property: CssProperty::Display(DisplayValue::Grid),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target: node });
+    }
+    Ok(ops)
+}
+
+/// Shadow DOM slot redistribution: attach shadow roots with multiple slots,
+/// then rapidly reassign slot attributes on light DOM children. This triggers
+/// slot redistribution logic which is prone to stale reference bugs.
+fn generate_slot_redistribution(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::new();
+    // Attach shadow roots to several hosts
+    let host_count = u.int_in_range(2..=5)?;
+    for _ in 0..host_count {
+        let host = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        ops.push(JsOperation::AttachShadowRoot {
+            target: host,
+            mode: ShadowRootMode::Open,
+        });
+        ops.push(JsOperation::ShadowRootSetInnerHTML {
+            host,
+            html: InnerHtmlContent(
+                "<div><slot></slot><slot name='a'></slot><slot name='b'></slot></div>".to_string(),
+            ),
+        });
+    }
+    // Force layout
+    let layout_target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+    ops.push(JsOperation::GetOffsetWidth {
+        target: layout_target,
+    });
+
+    // Reassign slots rapidly
+    let slot_names = ["", "a", "b", "c"];
+    let reassign_rounds = u.int_in_range(5..=20)?;
+    for _ in 0..reassign_rounds {
+        let target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        let name_idx: usize = u.arbitrary()?;
+        ops.push(JsOperation::SetSlotAttribute {
+            target,
+            slot_name: String8(slot_names[name_idx % slot_names.len()].to_string()),
+        });
+        // Force layout between reassignments
+        if u.arbitrary::<bool>()? {
+            let lt = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+            ops.push(JsOperation::GetOffsetWidth { target: lt });
+        }
+    }
+    // GC + layout
+    ops.push(JsOperation::ForceGC);
+    let final_target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+    ops.push(JsOperation::GetOffsetWidth {
+        target: final_target,
+    });
+    Ok(ops)
+}
+
+/// Multi-column fragmentation: set up a multi-column container, rapidly change
+/// column count while inserting/removing children and forcing layout. Then switch
+/// to display:none and back. Column fragmentation logic is a rich source of crashes.
+fn generate_column_fragmentation(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::new();
+    let target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+
+    // Set up multi-column container
+    ops.push(JsOperation::SetInlineStyle {
+        target,
+        property: CssProperty::ColumnCount(ColumnCountValue::Number(u.int_in_range(2..=10)?)),
+    });
+    ops.push(JsOperation::GetOffsetWidth { target });
+
+    // Rapidly change column count
+    let rounds = u.int_in_range(5..=15)?;
+    for _ in 0..rounds {
+        let count = u.int_in_range(1..=20)?;
+        ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: CssProperty::ColumnCount(ColumnCountValue::Number(count)),
+        });
+        // Insert/remove children
+        if u.arbitrary::<bool>()? {
+            ops.push(JsOperation::SetInnerHTML {
+                target,
+                html: InnerHtmlContent(
+                    "<p>col1</p><p style='break-before:column'>col2</p><p>col3</p>".to_string(),
+                ),
+            });
+        }
+        if u.arbitrary::<bool>()? {
+            if let Some(child) = try_node(u) {
+                ops.push(JsOperation::RemoveChild { target: child });
+            }
+        }
+        ops.push(JsOperation::GetOffsetWidth { target });
+    }
+    // Switch to display:none then back
+    ops.push(JsOperation::SetInlineStyle {
+        target,
+        property: CssProperty::Display(DisplayValue::None),
+    });
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::SetInlineStyle {
+        target,
+        property: CssProperty::Display(DisplayValue::Block),
+    });
+    ops.push(JsOperation::GetOffsetWidth { target });
+    Ok(ops)
+}
+
+/// Container query cycle: set up a container query container, then rapidly toggle
+/// container-type and resize, triggering @container evaluation on corrupted state.
+/// Can create dependency cycles in container query resolution.
+fn generate_container_query_cycle(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::new();
+    let target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+
+    // Set up container query container
+    ops.push(JsOperation::SetContainerType {
+        target,
+        container_type: oxiom_ir::js::ContainerTypeValue::InlineSize,
+    });
+    ops.push(JsOperation::GetOffsetWidth { target });
+
+    // Rapidly toggle container-type (can corrupt container query state)
+    let types = [
+        oxiom_ir::js::ContainerTypeValue::Normal,
+        oxiom_ir::js::ContainerTypeValue::InlineSize,
+        oxiom_ir::js::ContainerTypeValue::Size,
+    ];
+    let rounds = u.int_in_range(5..=15)?;
+    for _ in 0..rounds {
+        let idx: usize = u.arbitrary()?;
+        ops.push(JsOperation::SetContainerType {
+            target,
+            container_type: types[idx % types.len()],
+        });
+        // Change size to trigger @container
+        ops.push(JsOperation::SetInlineStyle {
+            target,
+            property: CssProperty::Width(LengthOrAuto::Length(LengthValue::Px(
+                u.int_in_range(1..=1000)?,
+            ))),
+        });
+        ops.push(JsOperation::GetOffsetWidth { target });
+        // Also switch display to invalidate container
+        if u.arbitrary::<bool>()? {
+            ops.push(JsOperation::SetInlineStyle {
+                target,
+                property: CssProperty::Display(DisplayValue::None),
+            });
+            ops.push(JsOperation::GetOffsetWidth { target });
+            ops.push(JsOperation::SetInlineStyle {
+                target,
+                property: CssProperty::Display(DisplayValue::Block),
+            });
+        }
+    }
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::GetOffsetWidth { target });
+    Ok(ops)
+}
+
+/// Focus/selection + DOM mutation UAF: make nodes contenteditable, create selections
+/// across nodes, remove selected nodes, then execute editing commands on stale selections.
+/// Targets the editing/selection lifecycle which is a rich source of UAF bugs.
+fn generate_focus_navigation_attack(u: &mut Unstructured) -> arbitrary::Result<Vec<JsOperation>> {
+    let mut ops = Vec::new();
+
+    // Make nodes contenteditable
+    let edit_count = u.int_in_range(2..=5)?;
+    for _ in 0..edit_count {
+        let target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        ops.push(JsOperation::SetAttribute {
+            target,
+            attr_name: AttrName::ContentEditable,
+            attr_value: String8("true".to_string()),
+        });
+    }
+
+    // Focus + create selection
+    let focus_target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+    ops.push(JsOperation::FocusNode {
+        target: focus_target,
+    });
+    ops.push(JsOperation::SelectAllContent);
+
+    // Set selection range
+    ops.push(JsOperation::SetSelectionRange {
+        anchor_node: try_node(u).ok_or(arbitrary::Error::NotEnoughData)?,
+        anchor_offset: u.int_in_range(0..=5)?,
+        focus_node: try_node(u).ok_or(arbitrary::Error::NotEnoughData)?,
+        focus_offset: u.int_in_range(0..=5)?,
+    });
+
+    // Remove nodes that are in the selection
+    let remove_count = u.int_in_range(1..=4)?;
+    for _ in 0..remove_count {
+        let target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        ops.push(JsOperation::RemoveChild { target });
+    }
+
+    // Execute commands on stale selection
+    let commands = [
+        ExecCommandType::InsertHTML,
+        ExecCommandType::Delete,
+        ExecCommandType::Bold,
+        ExecCommandType::InsertText,
+        ExecCommandType::InsertUnorderedList,
+        ExecCommandType::FormatBlock,
+    ];
+    let cmd_count = u.int_in_range(2..=6)?;
+    for _ in 0..cmd_count {
+        let idx: usize = u.arbitrary()?;
+        ops.push(JsOperation::ExecCommand {
+            command: commands[idx % commands.len()],
+        });
+        let layout_target = try_node(u).ok_or(arbitrary::Error::NotEnoughData)?;
+        ops.push(JsOperation::GetOffsetWidth {
+            target: layout_target,
+        });
+    }
+
+    // GC + access selection
+    ops.push(JsOperation::ForceGC);
+    ops.push(JsOperation::SelectAllContent);
+    ops.push(JsOperation::GetOffsetWidth {
+        target: focus_target,
+    });
+    Ok(ops)
+}
+
 // ============================
 // HELPER FUNCTIONS
 // ============================

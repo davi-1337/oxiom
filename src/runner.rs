@@ -421,7 +421,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                         let meta_path = t_crash_dir.join(format!("crash-{}.json", unique_idx));
                         let _ = tokio::fs::write(&meta_path, &metadata).await;
 
-                        if crash_type.is_sanitizer() {
+                        if crash_type.is_high_value() {
                             let error_desc = asan_error_type.unwrap_or(crash_type.as_str());
                             tracing::error!(
                                 "!!! {} #{} at iter {} — {} — saved crash-{}.html",
