@@ -586,6 +586,95 @@ pub fn serialize_property(prop: &CssProperty, out: &mut String) {
             });
             out.push(';');
         }
+        // Container queries
+        CssProperty::ContainerType(v) => {
+            out.push_str("container-type: ");
+            out.push_str(match v {
+                ContainerTypeValue::Normal => "normal",
+                ContainerTypeValue::InlineSize => "inline-size",
+                ContainerTypeValue::Size => "size",
+            });
+            out.push(';');
+        }
+        CssProperty::ContainerName(s) => {
+            out.push_str("container-name: ");
+            out.push_str(&s.0);
+            out.push(';');
+        }
+        // Subgrid
+        CssProperty::GridTemplateColumnsSubgrid => {
+            out.push_str("grid-template-columns: subgrid;");
+        }
+        CssProperty::GridTemplateRowsSubgrid => {
+            out.push_str("grid-template-rows: subgrid;");
+        }
+        // Scroll snap
+        CssProperty::ScrollSnapType(v) => {
+            out.push_str("scroll-snap-type: ");
+            out.push_str(match v {
+                ScrollSnapTypeValue::None => "none",
+                ScrollSnapTypeValue::XMandatory => "x mandatory",
+                ScrollSnapTypeValue::YMandatory => "y mandatory",
+                ScrollSnapTypeValue::XProximity => "x proximity",
+                ScrollSnapTypeValue::YProximity => "y proximity",
+                ScrollSnapTypeValue::BlockMandatory => "block mandatory",
+                ScrollSnapTypeValue::InlineMandatory => "inline mandatory",
+                ScrollSnapTypeValue::BothMandatory => "both mandatory",
+            });
+            out.push(';');
+        }
+        CssProperty::ScrollSnapAlign(v) => {
+            out.push_str("scroll-snap-align: ");
+            out.push_str(match v {
+                ScrollSnapAlignValue::None => "none",
+                ScrollSnapAlignValue::Start => "start",
+                ScrollSnapAlignValue::End => "end",
+                ScrollSnapAlignValue::Center => "center",
+            });
+            out.push(';');
+        }
+        // Aspect ratio
+        CssProperty::AspectRatio(v) => {
+            out.push_str("aspect-ratio: ");
+            match v {
+                AspectRatioValue::Auto => out.push_str("auto"),
+                AspectRatioValue::Ratio(a, b) => write!(out, "{}/{}", a, b).unwrap(),
+            }
+            out.push(';');
+        }
+        // Text wrap
+        CssProperty::TextWrap(v) => {
+            out.push_str("text-wrap: ");
+            out.push_str(match v {
+                TextWrapValue::Wrap => "wrap",
+                TextWrapValue::Nowrap => "nowrap",
+                TextWrapValue::Balance => "balance",
+                TextWrapValue::Pretty => "pretty",
+                TextWrapValue::Stable => "stable",
+            });
+            out.push(';');
+        }
+        // Logical properties
+        CssProperty::InlineSize(v) => {
+            out.push_str("inline-size: ");
+            serialize_length_or_auto(v, out);
+            out.push(';');
+        }
+        CssProperty::BlockSize(v) => {
+            out.push_str("block-size: ");
+            serialize_length_or_auto(v, out);
+            out.push(';');
+        }
+        CssProperty::MarginInline(v) => {
+            out.push_str("margin-inline: ");
+            serialize_length_or_auto(v, out);
+            out.push(';');
+        }
+        CssProperty::PaddingBlock(v) => {
+            out.push_str("padding-block: ");
+            serialize_length(v, out);
+            out.push(';');
+        }
     }
 }
 
