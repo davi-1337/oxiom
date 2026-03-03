@@ -1117,3 +1117,49 @@ pub enum SupportsCondition {
     Property(CssPropertyName),
     Not(Box<SupportsCondition>),
 }
+
+// ============================
+// New CSS value types for crash-finding
+// ============================
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum ContainerTypeValue {
+    Normal,
+    InlineSize,
+    Size,
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum ScrollSnapTypeValue {
+    None,
+    XMandatory,
+    YMandatory,
+    XProximity,
+    YProximity,
+    BlockMandatory,
+    InlineMandatory,
+    BothMandatory,
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum ScrollSnapAlignValue {
+    None,
+    Start,
+    End,
+    Center,
+}
+
+#[derive(Debug, Clone, Arbitrary)]
+pub enum AspectRatioValue {
+    Auto,
+    Ratio(u16, u16),
+}
+
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum TextWrapValue {
+    Wrap,
+    Nowrap,
+    Balance,
+    Pretty,
+    Stable,
+}
