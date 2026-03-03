@@ -580,6 +580,145 @@ fn serialize_operation(op: &JsOperation, out: &mut String, indent: usize) {
                 target.0
             ).unwrap();
         }
+
+        // ========================================
+        // Blink-killer operations
+        // ========================================
+
+        JsOperation::SetSelectionRange {
+            anchor_node,
+            anchor_offset,
+            focus_node,
+            focus_offset,
+        } => {
+            write!(
+                out,
+                "{pad}try {{ var sel = window.getSelection(); var r = document.createRange(); r.setStart(getNode({}), {}); r.setEnd(getNode({}), {}); sel.removeAllRanges(); sel.addRange(r); }} catch(e) {{}}\n",
+                anchor_node.0, anchor_offset, focus_node.0, focus_offset
+            ).unwrap();
+        }
+
+        JsOperation::WebAnimate { target, duration_ms } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).animate([{{opacity:'0',transform:'scale(0)'}},{{opacity:'1',transform:'scale(1)'}}], {{duration:{},fill:'forwards'}}); }} catch(e) {{}}\n",
+                target.0, duration_ms
+            ).unwrap();
+        }
+
+        JsOperation::CancelAnimations { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).getAnimations().forEach(function(a){{a.cancel();}}); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::GetAnimations { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).getAnimations(); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::SetContainerType { target, container_type } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).style.containerType = '{}'; }} catch(e) {{}}\n",
+                target.0, container_type.as_str()
+            ).unwrap();
+        }
+
+        JsOperation::ClassListBatch { target, ops } => {
+            for class_op in ops {
+                match class_op {
+                    ClassListOp::Add(s) => {
+                        write!(
+                            out,
+                            "{pad}try {{ getNode({}).classList.add('{}'); }} catch(e) {{}}\n",
+                            target.0, escape_js(&s.0)
+                        ).unwrap();
+                    }
+                    ClassListOp::Remove(s) => {
+                        write!(
+                            out,
+                            "{pad}try {{ getNode({}).classList.remove('{}'); }} catch(e) {{}}\n",
+                            target.0, escape_js(&s.0)
+                        ).unwrap();
+                    }
+                    ClassListOp::Toggle(s) => {
+                        write!(
+                            out,
+                            "{pad}try {{ getNode({}).classList.toggle('{}'); }} catch(e) {{}}\n",
+                            target.0, escape_js(&s.0)
+                        ).unwrap();
+                    }
+                    ClassListOp::Replace(a, b) => {
+                        write!(
+                            out,
+                            "{pad}try {{ getNode({}).classList.replace('{}','{}'); }} catch(e) {{}}\n",
+                            target.0, escape_js(&a.0), escape_js(&b.0)
+                        ).unwrap();
+                    }
+                }
+            }
+        }
+
+        JsOperation::SetSlotAttribute { target, slot_name } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).setAttribute('slot', '{}'); }} catch(e) {{}}\n",
+                target.0, escape_js(&slot_name.0)
+            ).unwrap();
+        }
+
+        JsOperation::ToggleDetailsOpen { target } => {
+            write!(
+                out,
+                "{pad}try {{ var d = getNode({}); d.open = !d.open; }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::ShowDialog { target, modal } => {
+            if *modal {
+                write!(
+                    out,
+                    "{pad}try {{ getNode({}).showModal(); }} catch(e) {{}}\n",
+                    target.0
+                ).unwrap();
+            } else {
+                write!(
+                    out,
+                    "{pad}try {{ getNode({}).show(); }} catch(e) {{}}\n",
+                    target.0
+                ).unwrap();
+            }
+        }
+
+        JsOperation::CloseDialog { target } => {
+            write!(
+                out,
+                "{pad}try {{ getNode({}).close(); }} catch(e) {{}}\n",
+                target.0
+            ).unwrap();
+        }
+
+        JsOperation::GetPseudoComputedStyle { target, pseudo } => {
+            write!(
+                out,
+                "{pad}try {{ getComputedStyle(getNode({}), '{}').getPropertyValue('display'); }} catch(e) {{}}\n",
+                target.0, pseudo.as_str()
+            ).unwrap();
+        }
+
+        JsOperation::PrintLayout => {
+            write!(
+                out,
+                "{pad}try {{ document.body.style.display = 'none'; void document.body.offsetHeight; document.body.style.display = ''; }} catch(e) {{}}\n"
+            ).unwrap();
+        }
     }
 }
 
