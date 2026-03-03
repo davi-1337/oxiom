@@ -259,52 +259,51 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
             tracing::debug!("[iter {}] {} bytes (iter_seed={})", i, html_len, iter_seed);
         }
 
-        // Clone for async task
-        let sem = sem.clone();
-        let chrome_path = chrome_path.clone();
-        let crash_dir = crash_dir.clone();
-        let completed = completed.clone();
-        let crash_count = crash_count.clone();
-        let unique_crash_count = unique_crash_count.clone();
-        let timeout_count = timeout_count.clone();
-        let asan_found = asan_found.clone();
-        let dedup = dedup.clone();
+        // Clone for async task (prefixed t_ to not shadow outer Arcs)
+        let t_sem = sem.clone();
+        let t_chrome = chrome_path.clone();
+        let t_crash_dir = crash_dir.clone();
+        let t_completed = completed.clone();
+        let t_crash_count = crash_count.clone();
+        let t_unique_crash = unique_crash_count.clone();
+        let t_timeout_count = timeout_count.clone();
+        let t_asan_found = asan_found.clone();
+        let t_dedup = dedup.clone();
         let seed_info = format!("master={},iter={}", actual_seed, iter_seed);
 
         let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
+            let _permit = t_sem.acquire().await.unwrap();
 
-            let result = cdp::run_testcase(&chrome_path, &abs_path, timeout, virtual_time_budget).await;
+            let result = cdp::run_testcase(&t_chrome, &abs_path, timeout, virtual_time_budget).await;
 
             match result {
                 TestResult::Ok => {
                     let _ = tokio::fs::remove_file(&filepath).await;
                 }
                 TestResult::Crash { log, crash_type, signal, exit_code } => {
-                    crash_count.fetch_add(1, Ordering::Relaxed);
+                    t_crash_count.fetch_add(1, Ordering::Relaxed);
 
                     let is_unique = {
-                        let mut d = dedup.lock().unwrap();
+                        let mut d = t_dedup.lock().unwrap();
                         d.is_new(&log)
                     };
 
                     if is_unique {
-                        let unique_idx = unique_crash_count.fetch_add(1, Ordering::Relaxed);
+                        let unique_idx = t_unique_crash.fetch_add(1, Ordering::Relaxed);
 
                         let asan_error_type = cdp::extract_asan_error_type(&log);
 
-                        // Save all crash artifacts
-                        let crash_html = crash_dir.join(format!("crash-{}.html", unique_idx));
+                        let crash_html = t_crash_dir.join(format!("crash-{}.html", unique_idx));
                         let _ = tokio::fs::copy(&filepath, &crash_html).await;
 
-                        let crash_log_path = crash_dir.join(format!("crash-{}.log", unique_idx));
+                        let crash_log_path = t_crash_dir.join(format!("crash-{}.log", unique_idx));
                         let _ = tokio::fs::write(&crash_log_path, &log).await;
 
                         let metadata = build_crash_metadata(
                             i, crash_type, signal, exit_code,
                             html_len, &seed_info, asan_error_type,
                         );
-                        let meta_path = crash_dir.join(format!("crash-{}.json", unique_idx));
+                        let meta_path = t_crash_dir.join(format!("crash-{}.json", unique_idx));
                         let _ = tokio::fs::write(&meta_path, &metadata).await;
 
                         if crash_type.is_sanitizer() {
@@ -316,7 +315,7 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                             for line in log.lines().take(20) {
                                 tracing::error!("  {}", line);
                             }
-                            asan_found.store(true, Ordering::Relaxed);
+                            t_asan_found.store(true, Ordering::Relaxed);
                         } else {
                             tracing::warn!(
                                 "{} crash #{} at iter {} — saved crash-{}.html",
@@ -328,12 +327,12 @@ pub async fn run(config: RunnerConfig) -> anyhow::Result<()> {
                     let _ = tokio::fs::remove_file(&filepath).await;
                 }
                 TestResult::Timeout => {
-                    timeout_count.fetch_add(1, Ordering::Relaxed);
+                    t_timeout_count.fetch_add(1, Ordering::Relaxed);
                     let _ = tokio::fs::remove_file(&filepath).await;
                 }
             }
 
-            completed.fetch_add(1, Ordering::Relaxed);
+            t_completed.fetch_add(1, Ordering::Relaxed);
         });
 
         handles.push(handle);

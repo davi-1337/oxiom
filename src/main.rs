@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn ctrlc_handler(shutdown: Arc<AtomicU8>) {
-    let _ = ctrlc::handle(move || {
+    let _ = ctrlc::set_handler(move || {
         let prev = shutdown.fetch_add(1, Ordering::SeqCst);
         match prev {
             0 => {
